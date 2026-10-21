@@ -30,6 +30,24 @@ Android 13+ · ARM64 · Vulkan · MIT · **需要自备游戏文件和密钥**
 运行时核心（装载器、ARM64 执行、NVN→Vulkan 翻译、系统服务）来自 Switch2Android，
 下面这些是在其之上新增的工作。
 
+### 宝可梦 明亮珍珠：实测结果
+
+测量方法、分区域 GPU 数据和取舍说明见
+[docs/PEARL-OPTIMIZATIONS.md](docs/PEARL-OPTIMIZATIONS.md)。
+
+| 项目 | 优化前 | 优化后 |
+|---|---|---|
+| 每帧 GPU（城镇） | 26.2 ms | **17.4 ms** |
+| 帧率 | 固定 30fps | 轻场景 **58–60fps**、城镇 40–47、屋内 27–35 |
+| 屋内外过场（热缓存） | 6.8 s | **5.8 s** |
+| 画面填充 | 16:9 留黑边 | **拉伸 / 保持比例 / 裁切**，游戏内可切 |
+| 虚拟按键 | 一直显示 | **接手柄时自动隐藏** |
+| 切后台 | 宿主线程崩溃 | 已修复 |
+
+场景加载是**按帧推进**的（Unity 的 `LoadSceneAsync` 每帧推进固定工作量），
+所以“提升帧率”同时也是“缩短过场”的优化。游戏逻辑本身是按时间的——
+30fps 和 44fps 下同一时长按键的位移一致，提高帧率不会让游戏加速。
+
 **Unity 支持**
 - 从 UnityFS 的 `Shader.compressedBlob` 中提取 Switch 平台的 NVN 着色器，
   生成 `{key}.control/.code` 供离线翻译：`tools/extract_unity_shaders.py`。

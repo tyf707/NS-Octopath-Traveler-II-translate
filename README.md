@@ -34,6 +34,25 @@ packages are not supported.
 The core runtime (loader, ARM64 execution, NVN→Vulkan translation, system services) is the
 Switch2Android core; the work below is layered on top of it.
 
+### Pokémon Shining Pearl: measured results
+
+Details, measurement method and per-region GPU data:
+[docs/PEARL-OPTIMIZATIONS.md](docs/PEARL-OPTIMIZATIONS.md).
+
+| Area | Before | After |
+|---|---|---|
+| GPU per frame (town) | 26.2 ms | **17.4 ms** |
+| Frame rate | 30 fps fixed | **58–60 fps** light, 40–47 town, 27–35 indoors |
+| Warm indoor/outdoor transition | 6.8 s | **5.8 s** |
+| Display | 16:9 letterboxed | **stretch / fit / crop**, switchable in-game |
+| Virtual buttons | always visible | **hidden while a gamepad is connected** |
+| Backgrounding | host-thread crash | fixed |
+
+Scene loading is **frame-bound** (Unity advances `LoadSceneAsync` per frame), so the frame
+rate work is also the transition work. Gameplay itself is time-based — the player moves
+the same distance per second at 30 and at 44 fps, so a higher frame rate does not speed
+up the game.
+
 **Unity support**
 - Shader recovery from UnityFS bundles (`Shader.compressedBlob`) into `{key}.control/.code`
   for the offline translator: `tools/extract_unity_shaders.py`.
