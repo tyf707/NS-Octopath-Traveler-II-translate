@@ -1,5 +1,5 @@
-Switch2Android: build and install instructions for agents
-=======================================================
+NS-translate-Android: build and install instructions for agents
+==============================================================
 
 Follow these steps to build an Android app from the user's own NSP files.
 If installation was requested, continue through device installation and launch
@@ -23,7 +23,8 @@ You need:
 Read README.md and the profiles/ directory for supported games and versions.
 OCTOPATH TRAVELER II requires version 1.1.1, update 131072, title ID
 0100a3501946e000. TRIANGLE STRATEGY requires version 1.1.1, update 262144,
-title ID 0100cc80140f8000. DLC is optional.
+title ID 0100cc80140f8000. Pokemon Shining Pearl requires version 1.3.0,
+update 393216, title ID 010018e011d92000. DLC is optional.
 
 Only common-ticket NSPs are supported. Do not obtain games or keys for the user,
 upload their files, or bypass a missing profile, build-ID check or validation
@@ -38,8 +39,8 @@ space. Keep these variables in the shell environment used for later steps.
 
     export S2A_INPUT="/absolute/path/to/nsp-directory"
     export S2A_KEYS="/absolute/path/to/prod.keys"
-    export S2A_WORK="$HOME/switch2android-work"
-    export S2A_OUT="$HOME/switch2android-output"
+    export S2A_WORK="$HOME/ns-work"
+    export S2A_OUT="$HOME/ns-output"
 
     test -f switch2android.py
     test -f scripts/bootstrap-tools.sh
@@ -51,7 +52,8 @@ space. Keep these variables in the shell environment used for later steps.
 Stop on a failed check. Resolve symlinks when checking that all four paths are
 outside the repository. Keep input, work and output directories separate.
 For OCTOPATH TRAVELER II, allow about 60 GB of free host storage in total; both
-the work and output volumes need room if they are on different disks.
+the work and output volumes need room if they are on different disks. Pokemon
+Shining Pearl needs about 12 GB.
 
 Preserve original NSPs, keys and existing outputs. Use a new output directory
 if the intended game/version directory already exists. Reuse the work directory
@@ -136,6 +138,9 @@ the matching package. Do not silently switch games or versions.
 For TRIANGLE STRATEGY 1.1.1, use S2A_TITLE_ID="0100cc80140f8000" and
 S2A_VERSION="262144".
 
+For Pokemon Shining Pearl 1.3.0, use S2A_TITLE_ID="010018e011d92000" and
+S2A_VERSION="393216".
+
 The build includes matching DLC automatically. Do not omit supplied DLC unless
 the user requested it; use --no-dlc only in that case. Duplicate title/version
 packages or DLC requiring a newer update must be resolved before building.
@@ -215,7 +220,8 @@ user to unlock the device and accept the USB debugging prompt.
 
 Require Android API 33 or later, arm64-v8a and Vulkan support. These are minimum
 requirements, not a guarantee for every GPU. For a fresh import, allow 14 GB
-of free device storage for OCTOPATH TRAVELER II or 20 GB for TRIANGLE STRATEGY.
+of free device storage for OCTOPATH TRAVELER II, 20 GB for TRIANGLE STRATEGY or
+7 GB for Pokemon Shining Pearl.
 
     .venv/bin/python switch2android.py install \
       "$S2A_PRODUCT" --serial "$S2A_SERIAL"

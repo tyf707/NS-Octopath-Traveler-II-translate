@@ -50,7 +50,7 @@ public final class LauncherActivity extends Activity {
             try (InputStream input = source.open()) {
                 if (input == null) throw new java.io.IOException("Cannot open selected resource bundle");
                 BundleInstaller.install(getApplicationContext(), config, input, text -> runOnUiThread(() -> status.setText(text)));
-                if (removable != null && !removable.delete()) android.util.Log.w("Switch2Android", "Imported input retained");
+                if (removable != null && !removable.delete()) android.util.Log.w("NS-Translate", "Imported input retained");
                 runOnUiThread(this::launch);
             } catch (Exception error) {
                 runOnUiThread(() -> {importing = false; select.setEnabled(true); status.setText("导入失败：" + error.getMessage() + "\n原有存档未受影响。请选择正确的资源包重试。"); getWindow().clearFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON);});

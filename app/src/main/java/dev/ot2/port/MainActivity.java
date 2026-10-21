@@ -247,7 +247,7 @@ public final class MainActivity extends Activity implements InputManager.InputDe
             return insets;
         });
         TextView title = new TextView(this);
-        title.setText("Switch2Android");
+        title.setText("NS-translate-Android");
         title.setTextSize(24); title.setTextColor(Color.rgb(236,216,171));
         layout.addView(title);
         TextView note = new TextView(this);

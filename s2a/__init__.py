@@ -1,1 +1,1 @@
-"""Local package assembly for Switch2Android."""
+"""Local package assembly for NS-translate-Android."""
