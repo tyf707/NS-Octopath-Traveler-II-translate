@@ -13,6 +13,7 @@
 extern "C" void ot2_host_log(const char*,...) {}
 extern "C" [[noreturn]] void ot2_host_die(const char*,...) {throw std::runtime_error("Unexpected host failure");}
 extern "C" uint64_t ot2_call_guest(const char*,const uint64_t*) {throw std::runtime_error("Unexpected guest call");}
+extern "C" uint64_t ot2_call_guest_address(uint64_t,const uint64_t*) {throw std::runtime_error("Unexpected guest address call");}
 extern "C" int ot2_signal_event(uint32_t){return 0;}
 extern "C" void vkhost_init(){}
 extern "C" uint64_t vkhost_frame_count(){return 0;}

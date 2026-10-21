@@ -18,6 +18,8 @@ public:
     void configure(uintptr_t address,size_t length,const std::array<uint8_t,32>& build){
         base=build==supported_build?address:0;size=length;
     }
+    // 供引擎适配层报告：本构建是否有匹配的 CVar 表。
+    bool supported() const {return base!=0;}
     // Memory exposes resolve(address, length, write): nullptr for unmapped or
     // protected memory. No pointer from the original game is trusted unchecked.
     template<class Memory> Result apply(Memory& memory,int fps){

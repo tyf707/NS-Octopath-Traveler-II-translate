@@ -19,6 +19,9 @@ import android.view.SurfaceHolder;
 import android.view.SurfaceView;
 import android.view.WindowManager;
 import android.widget.FrameLayout;
+import android.widget.RadioButton;
+import android.widget.RadioGroup;
+import android.view.Gravity;
 import android.widget.Button;
 import android.widget.LinearLayout;
 import android.widget.ScrollView;
@@ -41,6 +44,10 @@ public final class MainActivity extends Activity implements InputManager.InputDe
     private static native long getNativeFrameCount();
     private static native double[] getNativeFrameStats();
     private static native int setNativeTargetFps(int target);
+    private static native void setNativeAspectMode(int mode);
+    private static native void setNativeEngineKind(int kind);
+    private static native void setNativePatchList(String list);
+    private static native void setNativePresentInterval(int value);
     private Surface frameRateSurface;
     private int hintedFrameRate;
     private int applyTargetFps(int target){
@@ -198,14 +205,31 @@ public final class MainActivity extends Activity implements InputManager.InputDe
         }
         return super.onGenericMotionEvent(event);
     }
-    private void refreshController(){if(gameInput!=null&&gameInput.setControllerConnected(GameInputView.controllerPresent()))releaseInput();}
+    private void refreshController(){
+        if(gameInput==null)return;
+        // 0=自动（接手柄时隐藏）1=始终隐藏 2=始终显示；shaders/hide-controls 仍可强制隐藏。
+        final int mode=setting("buttons",0);
+        boolean hide;
+        if(mode==1)hide=true;
+        else if(mode==2)hide=false;
+        else{
+            hide=GameInputView.controllerPresent();
+            if(!hide){try{hide=new File(getFilesDir(),"shaders/hide-controls").exists();}catch(RuntimeException ignored){}}
+        }
+        if(gameInput.setControllerConnected(hide))releaseInput();
+    }
+    private final Runnable controllerPoll=new Runnable(){@Override public void run(){
+        if(!resumed||isDestroyed())return;
+        refreshController();
+        noticeHandler.postDelayed(this,2000);
+    }};
     @Override public void onInputDeviceAdded(int id) {refreshController();}
     @Override public void onInputDeviceChanged(int id) {if(id==controllerId)releaseInput();refreshController();}
     @Override public void onInputDeviceRemoved(int id) {if(id==controllerId){releaseInput();controllerId=-1;}refreshController();}
     @Override protected void onStart(){super.onStart();activitySession.start(this);}
-    @Override protected void onResume(){super.onResume();resumed=true;refreshAutomationInput();getSystemService(InputManager.class).registerInputDeviceListener(this,null);activitySession.resume(this,hasWindowFocus());refreshController();noticeHandler.post(noticePoll);if(performanceHud!=null)performanceHud.start();}
+    @Override protected void onResume(){super.onResume();resumed=true;refreshAutomationInput();getSystemService(InputManager.class).registerInputDeviceListener(this,null);activitySession.resume(this,hasWindowFocus());refreshController();noticeHandler.post(controllerPoll);noticeHandler.post(noticePoll);if(performanceHud!=null)performanceHud.start();}
     @Override public void onWindowFocusChanged(boolean focused){super.onWindowFocusChanged(focused);if(resumed){activitySession.focus(this,focused);if(!focused)releaseInput();}}
-    @Override protected void onPause(){resumed=false;noticeHandler.removeCallbacks(noticePoll);if(performanceHud!=null)performanceHud.stop();if(saveDialog!=null)saveDialog.dismiss();if(textDialog!=null)textDialog.dismiss();getSystemService(InputManager.class).unregisterInputDeviceListener(this);activitySession.pause(this);releaseInput();super.onPause();}
+    @Override protected void onPause(){resumed=false;noticeHandler.removeCallbacks(controllerPoll);noticeHandler.removeCallbacks(noticePoll);if(performanceHud!=null)performanceHud.stop();if(saveDialog!=null)saveDialog.dismiss();if(textDialog!=null)textDialog.dismiss();getSystemService(InputManager.class).unregisterInputDeviceListener(this);activitySession.pause(this);releaseInput();super.onPause();}
     @Override protected void onStop(){activitySession.stop(this);super.onStop();}
 
 
@@ -245,11 +269,13 @@ public final class MainActivity extends Activity implements InputManager.InputDe
             layout.addView(status,new LinearLayout.LayoutParams(-1,-2));
             root.addView(layout,new FrameLayout.LayoutParams(-1,-2));
             gameInput=new GameInputView(this,new GameInputView.Sink(){
-                @Override public void pad(long buttons,int x,int y,int z,int w){virtualButtons=buttons;virtualLx=x;virtualLy=y;virtualRx=z;virtualRy=w;updateButtons();}
+                @Override public void pad(long buttons,int x,int y,int z,int w){padCombo(buttons);virtualButtons=buttons;virtualLx=x;virtualLy=y;virtualRx=z;virtualRy=w;updateButtons();}
                 @Override public void touch(int action,int id,float x,float y,int w,int h){if(resumed&&hasWindowFocus()&&activitySession.owns(MainActivity.this))setNativeTouch(action,id,x,y,w,h);}
                 @Override public void cancelTouch(){if(activitySession.owns(MainActivity.this))cancelNativeTouch();}
             });
             root.addView(gameInput,new FrameLayout.LayoutParams(-1,-1));
+            installSettings(root);
+            applySettings();
             performanceHud=new PerformanceHud(this,MainActivity::getNativeFrameStats,this::applyTargetFps);
             FrameLayout.LayoutParams hudParams=new FrameLayout.LayoutParams(-2,-2,android.view.Gravity.TOP|android.view.Gravity.START);
             int margin=Math.round(12*getResources().getDisplayMetrics().density);
@@ -311,6 +337,12 @@ public final class MainActivity extends Activity implements InputManager.InputDe
             try {
                 long started=android.os.SystemClock.elapsedRealtime();
                 GameProfile profile=GameProfile.select(context,title);
+                // 引擎适配器：决定帧率/存档等引擎相关策略，并告知 native。
+                EngineHooks engine=EngineHooks.of(EngineHooks.detect(profile.gameRoot,profile.manifest));
+                EngineHooks.install(engine);
+                setNativeEngineKind(engine.kind().nativeId());
+                // 按标题的补丁：由 game-build.json 的 patches 数组声明；缺失时 native 用内置默认。
+                String patches=joinPatches(profile.manifest.optJSONArray("patches"));
                 File directory=new File(profile.gameRoot,"ExeFS");
                 String validation=profile.validateModules();
                 long verified=android.os.SystemClock.elapsedRealtime();
@@ -320,6 +352,11 @@ public final class MainActivity extends Activity implements InputManager.InputDe
                 // same expensive work twice on every normal launch.
                 JSONObject report=new JSONObject(runNativeProbe(validation.isEmpty()?directory.getAbsolutePath():"",profile.privateRoot.getAbsolutePath(),inspect));
                 report.put("title_id",profile.titleId);
+                if(patches!=null) setNativePatchList(patches);
+                report.put("engine",engine.kind().label());
+                if(patches!=null) report.put("patches",patches);
+                report.put("engine_frame_rate_patch",engine.supportsFrameRatePatch());
+                report.put("engine_frame_rate_patch_kind",engine.frameRatePatchKind());
                 report.put("module_validation_ms",verified-started);
                 report.put("probe_ms",android.os.SystemClock.elapsedRealtime()-verified);
                 report.put("model",Build.MODEL);report.put("soc",Build.SOC_MODEL);
@@ -377,5 +414,136 @@ public final class MainActivity extends Activity implements InputManager.InputDe
         text.append("报告保存于应用内部 files/probe.json");
         return text.toString();
     }
-    @Override public void onDestroy() { noticeHandler.removeCallbacks(noticePoll);if(saveDialog!=null)saveDialog.dismiss();Session.detach(this);activitySession.destroy(this);super.onDestroy(); }
+    // ---- 隐藏设置面板：连点屏幕顶部中间 5 次打开 ----
+    private static final String SETTINGS_PREFS="ot2-settings";
+    private View settingsPanel;
+    private long settingsFirstTap;
+    private int settingsTapCount;
+    private int dp(int value){return Math.round(value*getResources().getDisplayMetrics().density);}
+    private int setting(String key,int fallback){try{return getSharedPreferences(SETTINGS_PREFS,0).getInt(key,fallback);}catch(RuntimeException error){return fallback;}}
+    private void putSetting(String key,int value){try{getSharedPreferences(SETTINGS_PREFS,0).edit().putInt(key,value).apply();}catch(RuntimeException ignored){}}
+    /** "patches": ["settime-host"] → "settime-host"；数组存在但为空时返回 ""（显式不启用）。 */
+    private static String joinPatches(org.json.JSONArray patches){
+        if(patches==null)return null;
+        StringBuilder list=new StringBuilder();
+        for(int i=0;i<patches.length();i++){
+            String id=patches.optString(i,"");
+            if(id.isEmpty())continue;
+            if(list.length()>0)list.append(',');
+            list.append(id);
+        }
+        return list.toString();
+    }
+    private void applySettings(){
+        setNativeAspectMode(setting("aspect",2));
+        // 用户没手动选过帧率时，用引擎适配器给的默认值（Unity/UE4 默认 60Hz 上限）。
+        final int unset=Integer.MIN_VALUE;
+        final int saved=setting("interval",unset);
+        setNativePresentInterval(saved==unset?EngineHooks.current().defaultPresentInterval():saved);
+        refreshController();
+    }
+    private static final long PAD_PLUS=1L<<10,PAD_MINUS=1L<<11;   // 虚拟手柄 + / −
+    private static final long PAD_COMBO_WINDOW_MS=700;
+    private boolean padComboLatched,padPlusHeld,padMinusHeld;
+    private long padPlusAt,padMinusAt;
+    private void toggleSettings(){
+        if(settingsPanel==null)return;
+        settingsPanel.setVisibility(settingsPanel.getVisibility()==View.VISIBLE?View.GONE:View.VISIBLE);
+    }
+    private void padCombo(long buttons){
+        final boolean plus=(buttons&PAD_PLUS)!=0,minus=(buttons&PAD_MINUS)!=0;
+        final long now=android.os.SystemClock.uptimeMillis();
+        if(minus&&!padMinusHeld){
+            padMinusHeld=true;padMinusAt=now;
+            // 两指同时按，或 0.7 秒内先后按下，都算组合键。
+            if(plus||now-padPlusAt<=PAD_COMBO_WINDOW_MS){padComboLatched=true;toggleSettings();}
+        }
+        if(!minus)padMinusHeld=false;
+        if(plus&&!padPlusHeld){
+            padPlusHeld=true;padPlusAt=now;
+            if(minus||now-padMinusAt<=PAD_COMBO_WINDOW_MS){padComboLatched=true;toggleSettings();}
+        }
+        if(!plus)padPlusHeld=false;
+        if(!minus&&!plus)padComboLatched=false;
+    }
+    private void registerSettingsTap(){
+        final long now=android.os.SystemClock.uptimeMillis();
+        if(settingsTapCount==0||now-settingsFirstTap>2500){settingsFirstTap=now;settingsTapCount=1;return;}
+        if(++settingsTapCount>=5){settingsTapCount=0;if(settingsPanel!=null)settingsPanel.setVisibility(settingsPanel.getVisibility()==View.VISIBLE?View.GONE:View.VISIBLE);}
+    }
+    private void installSettings(FrameLayout root){
+        View hotspot=new View(this);
+        hotspot.setOnClickListener(v->registerSettingsTap());
+        root.addView(hotspot,new FrameLayout.LayoutParams(dp(240),dp(90),Gravity.TOP|Gravity.CENTER_HORIZONTAL));
+
+        LinearLayout panel=new LinearLayout(this);
+        panel.setOrientation(LinearLayout.VERTICAL);
+        panel.setBackgroundColor(0xF0101820);
+        final int pad=dp(22);panel.setPadding(pad,pad,pad,pad);
+        panel.setClickable(true);panel.setFocusable(true);
+
+        LinearLayout titleRow=new LinearLayout(this);titleRow.setOrientation(LinearLayout.HORIZONTAL);titleRow.setGravity(Gravity.CENTER_VERTICAL);
+        TextView title=new TextView(this);title.setText("画面与性能");title.setTextSize(20);title.setTextColor(0xFFFFFFFF);
+        title.setLayoutParams(new LinearLayout.LayoutParams(0,-2,1));
+        titleRow.addView(title);
+        Button close=new Button(this);close.setText("关闭");
+        close.setOnClickListener(v->{View parent=panel.getParent() instanceof View?(View)panel.getParent():panel;parent.setVisibility(View.GONE);});
+        titleRow.addView(close,new LinearLayout.LayoutParams(-2,-2));
+        panel.addView(titleRow);
+
+        panel.addView(sectionLabel("画面填充"));
+        RadioGroup aspect=new RadioGroup(this);
+        addRadio(aspect,"拉伸填满（无黑边）",2);
+        addRadio(aspect,"保持比例（左右黑边）",0);
+        addRadio(aspect,"裁切填满（上下裁切）",1);
+        panel.addView(aspect);
+        checkGroup(aspect,setting("aspect",2));
+        aspect.setOnCheckedChangeListener((group,id)->{int value=(Integer)group.findViewById(id).getTag();putSetting("aspect",value);setNativeAspectMode(value);});
+
+        panel.addView(sectionLabel("帧率上限"));
+        RadioGroup fps=new RadioGroup(this);
+        addRadio(fps,"60fps（默认，过场更快）",1);
+        addRadio(fps,"跟随游戏 30fps",-1);
+        panel.addView(fps);
+        checkGroup(fps,setting("interval",1));
+        fps.setOnCheckedChangeListener((group,id)->{int value=(Integer)group.findViewById(id).getTag();putSetting("interval",value);setNativePresentInterval(value);});
+
+        panel.addView(sectionLabel("屏幕虚拟按键"));
+        RadioGroup buttons=new RadioGroup(this);
+        addRadio(buttons,"自动（接手柄时隐藏）",0);
+        addRadio(buttons,"始终显示",2);
+        addRadio(buttons,"始终隐藏",1);
+        panel.addView(buttons);
+        checkGroup(buttons,setting("buttons",0));
+        TextView hint=new TextView(this);hint.setText("提示：同时按屏幕上的「−」和「+」可随时打开/关闭本面板");
+        hint.setTextColor(0xFF7F93A8);hint.setTextSize(12);hint.setPadding(0,dp(12),0,0);
+        panel.addView(hint);
+        buttons.setOnCheckedChangeListener((group,id)->{int value=(Integer)group.findViewById(id).getTag();putSetting("buttons",value);refreshController();});
+
+
+        ScrollView scroller=new ScrollView(this);
+        scroller.setBackgroundColor(0xF0101820);
+        scroller.setVisibility(View.GONE);
+        scroller.addView(panel);
+        FrameLayout.LayoutParams panelParams=new FrameLayout.LayoutParams(dp(600),dp(246),Gravity.TOP|Gravity.CENTER_HORIZONTAL);
+        panelParams.topMargin=dp(10);
+        root.addView(scroller,panelParams);
+        settingsPanel=scroller;
+    }
+    private TextView sectionLabel(String text){
+        TextView label=new TextView(this);label.setText(text);label.setTextColor(0xFF9FB3C8);label.setTextSize(13);
+        label.setPadding(0,dp(9),0,0);return label;
+    }
+    private void addRadio(RadioGroup group,String text,int value){
+        RadioButton button=new RadioButton(this);
+        button.setId(View.generateViewId());button.setText(text);button.setTextColor(0xFFFFFFFF);button.setTextSize(14);button.setPadding(0,0,0,0);button.setTag(value);
+        group.addView(button);
+    }
+    private void checkGroup(RadioGroup group,int value){
+        for(int i=0;i<group.getChildCount();i++){
+            View child=group.getChildAt(i);
+            if(child instanceof RadioButton && ((Integer)child.getTag())==value){group.check(child.getId());return;}
+        }
+    }
+    @Override public void onDestroy() { noticeHandler.removeCallbacks(controllerPoll);noticeHandler.removeCallbacks(noticePoll);if(saveDialog!=null)saveDialog.dismiss();Session.detach(this);activitySession.destroy(this);super.onDestroy(); }
 }

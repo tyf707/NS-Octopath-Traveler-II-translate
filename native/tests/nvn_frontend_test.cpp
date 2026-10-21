@@ -348,6 +348,18 @@ int main(){try{
         }
     }
     puts("PASS NVN texture transfers/clears copy snapshot ownership across pool retirement");
+    {
+        NVNtexture source{},destination{};
+        P(nvnTextureBuilderSetSize2D)(&tb,16,8);
+        P(nvnTextureInitialize)(&source,&tb);P(nvnTextureInitialize)(&destination,&tb);
+        Commands command;command.begin();
+        P(nvnCommandBufferDownsample)(&command.buffer,&source,&destination);
+        auto list=records(command.end());require(list.size()==1&&list[0]->op==OP_COPY_T2T,"downsample records real transfer");
+        const auto& copy=payload<p_copy_t2t>(list[0]);
+        require(!copy.has_sv&&!copy.has_dv&&copy.sr.width==16&&copy.sr.height==8&&copy.sr.depth==1&&copy.dr.width==16&&copy.dr.height==8,"downsample covers default texture views");
+        P(nvnTextureFinalize)(&source);P(nvnTextureFinalize)(&destination);
+    }
+    puts("PASS NVN whole-texture downsample records resolve regions");
 #ifdef OT2_FRONTEND_ONLY
     {
         NVNprogram p{};NVNshaderData shaders[2]{};

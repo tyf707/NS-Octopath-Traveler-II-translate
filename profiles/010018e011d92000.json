@@ -1,0 +1,16 @@
+{
+  "title_id": "010018e011d92000",
+  "name": "Pokemon Shining Pearl",
+  "status": "experimental",
+  "versions": [
+    393216
+  ],
+  "main_build_ids": [
+    "38f59cbda2eb9c44b72f94c4d25935a200000000000000000000000000000000"
+  ],
+  "resource_adapter": "unity",
+  "default_fps": 30,
+  "patches": [
+    "settime-host"
+  ]
+}

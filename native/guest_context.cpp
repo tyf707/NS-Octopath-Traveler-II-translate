@@ -1,4 +1,6 @@
 #include "guest_context.h"
+#include <cstring>
+extern "C" void ot2_host_log(const char* format, ...);
 #include "thread_services.h"
 #include <atomic>
 #include <pthread.h>
@@ -51,8 +53,31 @@ GuestThread* ot2_guest_context_create(){
     for(;index<GuestThreadCapacity;++index){uintptr_t free=0;if(__atomic_compare_exchange_n(&ot2_threads[index].host_tp,&free,UINTPTR_MAX,false,__ATOMIC_ACQ_REL,__ATOMIC_ACQUIRE)){c=&ot2_threads[index];break;}}
     if(!c)ot2_host_die("Guest live thread capacity exhausted");
     auto* owned=new Owned{c};owned->tls=allocate(owned->tls_size,PROT_READ|PROT_WRITE);
-    c->guest_tls=reinterpret_cast<uintptr_t>(owned->tls);c->guest_tlr=c->guest_tls+8192;
-    *reinterpret_cast<uintptr_t*>(c->guest_tlr+0x1f8)=c->guest_tlr+0x200;
+    /* Horizon 上 tpidrro_el0 指向的 TLS 与 svcGetThreadLocalRegion 返回的 TLR 是
+     * 同一块 0x200 区域（消息缓冲区在 +0，disable_count 在 +0x100）。
+     * 早期实现把它们分成两块，导致 SDK 读 TLS+0x1F8 永远是 0。
+     * On Horizon the TLS at tpidrro_el0 and the TLR are the same 0x200 region;
+     * splitting them made the SDK read a zeroed TLS+0x1F8. */
+    c->guest_tls=reinterpret_cast<uintptr_t>(owned->tls);c->guest_tlr=c->guest_tls;
+    /* SDK 在 TLS+0x1F8 存线程控制块指针，并读其 +0x1B0 作为线程标识（sdk+0x351890）。
+     * TLS+0x200 之后是 guest 自己的 TLS 变量区，会被覆盖，所以单独分配一块。
+     * The SDK keeps a thread control block pointer at TLS+0x1F8 and reads its
+     * +0x1B0 as the thread id; the area past TLS+0x200 belongs to the guest's
+     * own TLS variables, so allocate a dedicated block. */
+    { void* ctl=allocate(0x400,PROT_READ|PROT_WRITE);
+      *reinterpret_cast<uintptr_t*>(c->guest_tlr+0x1f8)=reinterpret_cast<uintptr_t>(ctl);
+      uint32_t tid=uint32_t(0x1001u+index);
+      std::memcpy(static_cast<uint8_t*>(ctl)+0x1b0,&tid,sizeof(tid)); }
+    /* SDK 通过 tpidrro_el0（就是 guest_tls）读 TLS+0x1F8 的线程控制指针，
+     * 其 +0x1B0 需是与 0 不同的线程标识，否则「是否是当前线程」会误判为真。
+     * The SDK reads the thread-control pointer from TLS+0x1F8 (tpidrro_el0 is
+     * guest_tls), so mirror it there with a non-zero thread id. */
+    { uintptr_t tls=c->guest_tls, scratch=tls+0x200;
+      *reinterpret_cast<uintptr_t*>(tls+0x1f8)=scratch;
+      uint32_t tid=uint32_t(0x1001u+index);
+      std::memcpy(reinterpret_cast<void*>(scratch+0x1b0),&tid,sizeof(tid));
+      ot2_host_log("TLS_INIT tls=%p scratch=%p tid=%x",reinterpret_cast<void*>(tls),
+                   reinterpret_cast<void*>(scratch),(unsigned)tid); }
     const size_t page=sysconf(_SC_PAGESIZE);c->stack_size=8*1024*1024;owned->stack_size=c->stack_size+2*page;
     owned->stack=allocate(owned->stack_size,PROT_NONE);c->stack=reinterpret_cast<uintptr_t>(owned->stack)+page;
     if(mprotect(reinterpret_cast<void*>(c->stack),c->stack_size,PROT_READ|PROT_WRITE))ot2_host_die("Guest stack protection failed");

@@ -133,8 +133,7 @@ uint64_t configure(R r){
     if(!r[1])return Invalid;auto d=decoder(r[0]);std::lock_guard control(d->control);stop(*d);std::lock_guard lock(d->mutex);
     if(d->codec){AMediaCodec_delete(d->codec);d->codec=nullptr;}if(d->config){AMediaFormat_delete(d->config);d->config=nullptr;}
     const auto* type=mime(d->type);if(!type)return Unsupported;
-    if(d->type<=3&&!((d->mode==2&&d->output==3)||(d->mode==1&&d->output==2)))return Unsupported;
-    if(d->type>3&&(d->mode!=1||d->output!=1))return Unsupported;
+    if(!movie::decoder_output_supported(d->type,d->output,d->mode))return Unsupported;
     auto* f=AMediaFormat_new();d->config=f;AMediaFormat_setString(f,"mime",type);
     for(const char* key:{"width","height","channel-count","sample-rate","max-input-size","profile","level"}){int32_t value;if(find_int(r[1],key,value))AMediaFormat_setInt32(f,key,value);}
     for(const char* key:{"csd-0","csd-1","csd-2"}){
@@ -219,6 +218,16 @@ uint64_t output_buffer(R r,bool with_format){
     }else{
         auto p=f.layout;int w=p.right-p.left+1,h=p.bottom-p.top+1;bool bgra=false;
         if(w<=0||h<=0||w>4096||h>4096)return Invalid;
+        if(d->mode==1&&d->output==4){
+            const auto bytes=call("_ZNK5movie6Buffer8CapacityEv",{r[2]});
+            const size_t needed=size_t(w)*h*3/2;
+            if(bytes<needed)return Invalid;
+            if(!movie::nv12(source,p,std::span(reinterpret_cast<uint8_t*>(base),needed))){
+                ot2_host_log("MOVIE_ERROR unsupported NV12 layout format=%x stride=%d slice=%d crop=%d,%d,%d,%d",p.format,p.stride,p.slice,p.left,p.top,p.right,p.bottom);
+                return Unsupported;
+            }
+            call("_ZN5movie6Buffer8SetRangeEii",{r[2],0,needed});
+        }else{
         if(d->mode==2){
             const auto tw=nvn("nvnTextureGetWidth",{base}),th=nvn("nvnTextureGetHeight",{base}),tf=nvn("nvnTextureGetFormat",{base});
             if(tw<uint64_t(p.right+1)||th<uint64_t(p.bottom+1)||(tf!=NVN_FORMAT_RGBA8&&tf!=NVN_FORMAT_RGBA8_SRGB&&tf!=NVN_FORMAT_BGRA8&&tf!=NVN_FORMAT_BGRA8_SRGB))return Unsupported;
@@ -234,6 +243,7 @@ uint64_t output_buffer(R r,bool with_format){
         }else{
             auto bytes=call("_ZNK5movie6Buffer8CapacityEv",{r[2]});if(d->output!=2||bytes<d->pixels.size())return Unsupported;
             memcpy(reinterpret_cast<void*>(base),d->pixels.data(),d->pixels.size());call("_ZN5movie6Buffer8SetRangeEii",{r[2],0,d->pixels.size()});
+        }
         }
     }
     f.copied=true;

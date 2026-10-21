@@ -496,7 +496,7 @@ typedef void (*NVNT_nvnCommandBufferSignalEvent)(NVNcommandBuffer*, const NVNeve
 //   nvnQueueBuilderGetCommandFlushThreshold
 //   nvnQueueBuilderGetMemorySize
 //   nvnQueueBuilderGetMemory
-//   nvnWindowBuilderSetNumActiveTextures
+typedef void (*NVNT_nvnWindowBuilderSetNumActiveTextures)(NVNwindowBuilder*, int);
 //   nvnWindowBuilderGetDevice
 //   nvnWindowBuilderGetNumTextures
 //   nvnWindowBuilderGetTexture

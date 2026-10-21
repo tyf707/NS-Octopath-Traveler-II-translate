@@ -1,4 +1,5 @@
 #include "guest.h"
+#include "game_profile.h"
 #include "fault_decode.h"
 #include "guest_clock.h"
 #include "frame_rate_patch.h"
@@ -10,9 +11,11 @@
 #include <asm/sigcontext.h>
 #include "graphics/backend.h"
 #include <android/log.h>
+#include <sys/system_properties.h>
 #include <array>
 #include <algorithm>
 #include <atomic>
+#include <unordered_set>
 #include <cstdarg>
 #include <cstdio>
 #include <cstring>
@@ -40,6 +43,17 @@ uint64_t ot2_host_stack_call(uint64_t (*)(uint64_t*),uint64_t*,uintptr_t);
 }
 namespace {
 struct Trap { uintptr_t pc; uint32_t instruction; const char* hook; uint64_t (*call)(uint64_t*)=nullptr; uint64_t hits=0; };
+struct alignas(16) GuestThreadContextImage {
+    uint64_t gprs[29];
+    uint64_t fp,lr,sp,pc;
+    uint32_t psr;
+    alignas(16) uint8_t fpu_gprs[32][16];
+    uint32_t fpcr,fpsr;
+    uint64_t tpidr;
+};
+static_assert(sizeof(GuestThreadContextImage)==0x320);
+static_assert(offsetof(GuestThreadContextImage,fpu_gprs)==0x110);
+static_assert(offsetof(GuestThreadContextImage,tpidr)==0x318);
 std::vector<Trap> traps;
 alignas(4) uint32_t fast_tls_enabled=1;
 std::atomic<uint64_t> tls_signal_count{0};
@@ -127,7 +141,58 @@ bool special(uint32_t instruction) {
         op==0xd51bd040 || op==0xd53be020 || op==0xd53be000;
 }
 #include "tls_rewrite.inc"
+/* 最近宿主服务（NVN/SDK 门）调用环形记录：看卡住时游戏还在做哪些系统调用。 */
+/* Ring of the latest host-service (NVN/SDK gate) calls: shows which system calls the game still makes while stalled. */
+static constexpr unsigned gate_ring_capacity=64;
+static std::atomic<unsigned> gate_ring[gate_ring_capacity];
+static std::atomic<unsigned> gate_ring_pos{0};
+/* 宿主服务（陷阱表）最近命中环形：只存静态名字指针。 */
+static constexpr unsigned service_ring_capacity=64;
+static const char* service_ring[service_ring_capacity];
+static std::atomic<unsigned> service_pos{0};
+/* 协程状态探针的落点（island 直接写这里，不走函数调用）。 */
+/* Landing zone for the coroutine state probe (the island writes here directly). */
+alignas(8) static volatile uint32_t coro_probe_slot[2]={0,0};
+/* 指针钩子落点：+0 = iterator 指针，+8 = 调用计数。 */
+alignas(8) struct { volatile uint64_t ptr; volatile uint32_t calls; volatile uint32_t pad; } coro_ptr_probe{};
+alignas(8) struct { volatile uint64_t ptr; volatile uint32_t calls; volatile uint32_t pad; } cb_reg_probe{};
+alignas(8) struct { volatile uint64_t ptr; volatile uint32_t calls; volatile uint32_t pad; } ex_probe{};
+alignas(8) struct { volatile uint64_t ptr; volatile uint32_t calls; volatile uint32_t pad; } post_probe{};
+alignas(8) struct { volatile uint64_t ptr; volatile uint32_t calls; volatile uint32_t pad; } prefs_ex_probe{};
+alignas(8) struct { volatile uint64_t ptr; volatile uint32_t calls; volatile uint32_t pad; } nre_probe{};
+extern "C" uint32_t ot2_prefs_ex_calls(void){return prefs_ex_probe.calls;}
+extern "C" uint64_t ot2_prefs_ex_ptr(void){return prefs_ex_probe.ptr;}
+extern "C" uint64_t ot2_nre_ptr(void){return nre_probe.ptr;}
+extern "C" uint32_t ot2_nre_calls(void){return nre_probe.calls;}
+extern "C" uint64_t ot2_ex_probe(void){return ex_probe.ptr;}
+extern "C" uint32_t ot2_ex_probe_calls(void){return ex_probe.calls;}
+extern "C" uint32_t ot2_post_probe_calls(void){return post_probe.calls;}
+extern "C" uint64_t ot2_cb_reg(void){return cb_reg_probe.ptr;}
+extern "C" uint32_t ot2_cb_reg_calls(void){return cb_reg_probe.calls;}
+extern "C" uint64_t ot2_coro_ptr(void){return coro_ptr_probe.ptr;}
+extern "C" uint32_t ot2_coro_ptr_calls(void){return coro_ptr_probe.calls;}
+alignas(8) static volatile uint32_t exc_probe_slot[2]={0,0};
+extern "C" uint32_t ot2_coro_probe_state(void){return coro_probe_slot[0];}
+extern "C" uint32_t ot2_coro_probe_calls(void){return coro_probe_slot[1];}
+extern "C" uint32_t ot2_exc_probe_calls(void){return exc_probe_slot[1];}
+extern "C" uint64_t ot2_host_set_start_time(uint64_t*);
 #include "system_rewrite.inc"
+extern "C" uint64_t ot2_call_guest_address(uint64_t,const uint64_t*);
+static uintptr_t fade_material_address=0;
+static uint64_t fade_apply(uint64_t* r,bool black) {
+    auto* self=reinterpret_cast<uint8_t*>(r[0]);
+    if(self) {
+        const float power=black?1.0f:0.0f;
+        const float zero=0.0f;
+        memcpy(self+0x28,&power,4);
+        memcpy(self+0x3c,&zero,4);
+        const uint64_t arguments[8]={r[0],0,0,0,0,0,0,0};
+        if(fade_material_address) ot2_call_guest_address(fade_material_address,arguments);
+    }
+    return 0;
+}
+static uint64_t fade_in_host(uint64_t* r){return fade_apply(r,false);}
+static uint64_t fade_out_host(uint64_t* r){return fade_apply(r,true);}
 void patch(uint8_t* base,size_t size) {
     const auto first_island=tls_islands.size();
     size_t tls_native=0,tls_fallback=0;
@@ -143,6 +208,13 @@ void patch(uint8_t* base,size_t size) {
     }
     seal_tls_islands(first_island);
     if(size>4096)log("TLS_PATCH base=%p bytes=%zu native=%zu signal=%zu islands=%zu",base,size,tls_native,tls_fallback,tls_islands.size()-first_island);
+}
+/* 调试探针：把某个 IL2CPP 方法入口换成只打日志的宿主服务（命中即记，跳过原函数）。 */
+/* Debug probe: replace an IL2CPP method entry with a log-only host service (records hits, skips the body). */
+static uint64_t probe_hit(uint64_t* r) {
+    log("PROBE_HIT thread=%#x x0=%llx x1=%llx x2=%llx x3=%llx",
+        ot2_thread_handle_current(),(unsigned long long)r[0],(unsigned long long)r[1],(unsigned long long)r[2],(unsigned long long)r[3]);
+    return 0;
 }
 void install_service_initializers(const ot2::LoadedGame& game) {
     const auto first_island=tls_islands.size();
@@ -180,6 +252,486 @@ void install_service_initializers(const ot2::LoadedGame& game) {
         const uint32_t brk=0xd4200000 | (0x703<<5);
         memcpy(reinterpret_cast<void*>(address),&brk,4);
     }
+    /* 服务覆盖自检：把游戏导出的 `_ZN2nn*` SDK 符号与我们的服务表对照，
+     * 给新游戏接入一个可读的清单（hooked=已由宿主接管，unhooked=跑游戏自带 SDK 代码）。
+     * debug.ot2.servicecheck=1 时额外打印未接管的符号名。 */
+    {
+        std::unordered_set<std::string> implemented;
+        size_t table_entries=0;
+        for(const auto* list:{&ot2::host_services(),&ot2::audio_services(),&ot2::input_services(),&ot2::movie_services()})
+            for(const auto& service:*list){implemented.insert(service.name);++table_entries;}
+        auto names=game.exported_names("_ZN2nn");
+        size_t hooked=0,unhooked=0;
+        std::vector<const std::string*> misses;
+        for(const auto& name:names){
+            if(implemented.count(name))++hooked;
+            else{++unhooked;if(misses.size()<64)misses.push_back(&name);}
+        }
+        log("SERVICE_COVERAGE sdk_exports=%zu hooked=%zu native=%zu table_entries=%zu",
+            names.size(),hooked,unhooked,table_entries);
+        char check[PROP_VALUE_MAX]{};
+        if(__system_property_get("debug.ot2.servicecheck",check)>0&&check[0]!='0'){
+            std::string chunk;
+            for(const auto* name:misses){
+                if(chunk.size()+name->size()>900){log("SERVICE_UNHOOKED %s",chunk.c_str());chunk.clear();}
+                if(!chunk.empty())chunk+=' ';
+                chunk+=*name;
+            }
+            if(!chunk.empty())log("SERVICE_UNHOOKED %s",chunk.c_str());
+            if(unhooked>misses.size())log("SERVICE_UNHOOKED truncated=%zu",unhooked-misses.size());
+        }
+    }
+    /* 用宿主时钟实现 SystemTimeWork.SetTime：本作开场场景里 GameManager 尚未初始化，
+     * GameManager.nowTime 是默认 DateTime(0001-01-01)，游戏自己的 SetTime 会对它调
+     * DateTime.ToFileTime 抛 ArgumentOutOfRangeException，把命名回调整个展开掉，
+     * 于是「命名成功后卡在博士场景」。这里用宿主时钟做同语义实现。
+     * 默认对 010018e011d92000 启用；debug.ot2.fixtime=0 可关闭（调试用）。
+     * TODO: 找到 GameManager.nowTime 未初始化的根因后可以移除本补丁。 */
+    {
+        char fix[PROP_VALUE_MAX]{};
+        const bool has_property=__system_property_get("debug.ot2.fixtime",fix)>0;
+        // 补丁开关：优先 profile 声明（game-build.json 的 patches），
+        // 未声明时退回内置默认（Unity 标题默认启用）；debug.ot2.fixtime=0 可强制关闭。
+        const bool enabled=has_property?(fix[0]!='0'):ot2::patch_enabled("settime-host",
+            ot2::configured_program_id()==0x010018e011d92000ULL||ot2::engine_kind()==ot2::Engine::unity);
+        if(enabled) {
+            for(const auto& m:images) if(m.name=="main") {
+                const auto address=reinterpret_cast<uintptr_t>(m.base)+0x1C177C0;
+                uint32_t original;memcpy(&original,reinterpret_cast<void*>(address),4);
+                if(patch_system(address,original,first_island,"SystemTimeWork_SetTime_host",ot2_host_set_start_time))
+                    log("SETTIME_HOST installed");
+                else log("SETTIME_HOST failed");
+            }
+        }
+    }
+    /* 过渡修复：Fader.OnUpdate 在场景切换后不再被 tick，遮罩材质停在
+     * fillPower=1 的不透明状态，画面全黑、演出协程等 isBusy 卡死。
+     * 这里把 FadeIn/FadeOut 变成瞬时完成（改 _fillPower/_speed 并立即 UpdateMaterial）。 */
+    {
+        char fix[PROP_VALUE_MAX]{};
+        const bool has_property=__system_property_get("debug.ot2.fadefix",fix)>0;
+        /* 默认关闭：实测它并不能解除黑屏，且可能干扰早期淡入流程；仅调试时用
+         * debug.ot2.fadefix=1 打开。 */
+        const bool enabled=has_property?(fix[0]!='0'):ot2::patch_enabled("fade-instant",false);
+        if(enabled) for(const auto& m:images) if(m.name=="main") {
+            const auto base=reinterpret_cast<uintptr_t>(m.base);
+            fade_material_address=base+0x24D03A0;
+            auto install=[&](uintptr_t address,uint64_t (*call)(uint64_t*),const char* name) {
+                uint32_t original;memcpy(&original,reinterpret_cast<void*>(address),4);
+                if(patch_system(address,original,first_island,name,call)) log("FADEFIX %s ok",name);
+                else log("FADEFIX %s failed",name);
+            };
+            install(base+0x24D04C0,fade_in_host,"FadeIn_instant");
+            install(base+0x24D05A0,fade_in_host,"FadeIn_duration_instant");
+            install(base+0x24D0820,fade_out_host,"FadeOut_instant");
+            install(base+0x24D0900,fade_out_host,"FadeOut_duration_instant");
+        }
+    }
+    /* 诊断：打印模块基址，便于把栈上的地址映射回模块偏移。 */
+    for(const auto& m:images) log("MODULE %s base=%#llx size=%#llx",
+        m.name.c_str(),(unsigned long long)reinterpret_cast<uintptr_t>(m.base),(unsigned long long)m.size);
+    /* debug.ot2.probe=1：命名回调探针；debug.ot2.probe=2：协程 state 记录钩子。 */
+    {
+        char probe[PROP_VALUE_MAX]{};
+        if(__system_property_get("debug.ot2.probe",probe)>0) {
+            if(!strcmp(probe,"30")) {
+                for(const auto& m:images) if(m.name=="main") {
+                    const auto base=reinterpret_cast<uintptr_t>(m.base);
+                    struct SceneProbe { uint64_t rva; volatile void* slot; const char* name; } points[]={
+                        {0x1E0F6A0,&coro_ptr_probe,"SceneSwitchNext"},
+                        {0x1C1F710,&ex_probe,"TitleInitialize"},
+                        {0x1C1F9B0,&nre_probe,"TitlePlayOpening"},
+                        {0x240C8B0,&cb_reg_probe,"TitleLoadAssetNext"},
+                        {0x240CBC0,&prefs_ex_probe,"TitleOpeningNext"},
+                        {0x240AB70,&post_probe,"TitleUpdate"},
+                    };
+                    for(const auto& point:points)
+                        log("SCENE_PROBE %s %s",point.name,
+                            patch_register_hook(base+point.rva,point.slot,first_island,0)?"installed":"failed");
+                }
+                goto probe_done;
+            }
+            if(!strcmp(probe,"29")) {
+                for(const auto& m:images) if(m.name=="main") {
+                    const auto base=reinterpret_cast<uintptr_t>(m.base);
+                    struct SceneProbe { uint64_t rva; volatile void* slot; unsigned reg; const char* name; } points[]={
+                        {0x44B34,&ex_probe,0,"RaiseExceptionObject"},
+                        {0x9AE10,&nre_probe,30,"RaiseExceptionCaller"},
+                        {0x1E19F30,&cb_reg_probe,0,"EventStartUpNext"},
+                        {0x1F1CA60,&prefs_ex_probe,0,"DailyEventUpdate"},
+                        {0x1F56E80,&post_probe,0,"BerryGrowUpdate"},
+                        {0x1B65F40,&coro_ptr_probe,0,"LoadObjectCreate"},
+                    };
+                    for(const auto& point:points)
+                        log("SCENE_PROBE %s %s",point.name,
+                            patch_register_hook(base+point.rva,point.slot,first_island,point.reg)?"installed":"failed");
+                }
+                goto probe_done;
+            }
+            // Read-only scene-transition diagnostics. The islands preserve the
+            // displaced instruction and registers; no coroutine state is changed.
+            if(!strcmp(probe,"28")) {
+                for(const auto& m:images) if(m.name=="main") {
+                    const auto base=reinterpret_cast<uintptr_t>(m.base);
+                    struct SceneProbe { uint64_t rva; volatile void* slot; const char* name; } points[]={
+                        {0x1E0F6A0,&coro_ptr_probe,"SceneSwitchNext"},
+                        {0x21B7820,&ex_probe,"FieldInitNext"},
+                        {0x21B8600,&nre_probe,"FieldInitAfterNext"},
+                        {0x1BC0C70,&cb_reg_probe,"FieldSetupNext"},
+                        {0x1BC3BF0,&prefs_ex_probe,"FieldLoadEnd"},
+                        {0x189E670,&post_probe,"ExceptionCtor"},
+                    };
+                    for(const auto& point:points)
+                        log("SCENE_PROBE %s %s",point.name,
+                            patch_register_hook(base+point.rva,point.slot,first_island,0)?"installed":"failed");
+                }
+                goto probe_done;
+            }
+            if(!strcmp(probe,"27")) {
+                for(const auto& m:images) if(m.name=="main") {
+                    const auto base=reinterpret_cast<uintptr_t>(m.base);
+                    if(patch_register_hook(base+0x21A4070,&ex_probe,first_island,0)) log("X1 LangOnUpdate");
+                    else log("X1 failed");
+                    if(patch_register_hook(base+0x21A5700,&nre_probe,first_island,0)) log("X2 OpOpenNext");
+                    else log("X2 failed");
+                    if(patch_register_hook(base+0x21A43D0,&cb_reg_probe,first_island,0)) log("X3 UpdateSelect");
+                    else log("X3 failed");
+                    if(patch_register_hook(base+0x21A48C0,&post_probe,first_island,0)) log("X4 OpenConfirm");
+                    else log("X4 failed");
+                }
+                goto probe_done;
+            }
+            if(!strcmp(probe,"26")) {
+                for(const auto& m:images) if(m.name=="main") {
+                    const auto base=reinterpret_cast<uintptr_t>(m.base);
+                    if(patch_register_hook(base+0x1F346D0,&ex_probe,first_island,0)) log("W1 PlayCorNext");
+                    else log("W1 failed");
+                    if(patch_register_hook(base+0x1F32860,&nre_probe,first_island,0)) log("W2 Play");
+                    else log("W2 failed");
+                    if(patch_register_hook(base+0x1F345E0,&cb_reg_probe,first_island,0)) log("W3 OpPlayNext");
+                    else log("W3 failed");
+                    if(patch_register_hook(base+0x1F32F10,&post_probe,first_island,0)) log("W4 SetFadeExit");
+                    else log("W4 failed");
+                }
+                goto probe_done;
+            }
+            if(!strcmp(probe,"25")) {
+                for(const auto& m:images) if(m.name=="main") {
+                    const auto base=reinterpret_cast<uintptr_t>(m.base);
+                    if(patch_register_hook(base+0x1F322D0,&ex_probe,first_island,0)) log("V1 DemoMyUpdate");
+                    else log("V1 failed");
+                    if(patch_register_hook(base+0x24D01B0,&nre_probe,first_island,0)) log("V2 FaderOnUpdate");
+                    else log("V2 failed");
+                    if(patch_register_hook(base+0x1F345E0,&cb_reg_probe,first_island,0)) log("V3 OpPlayNext");
+                    else log("V3 failed");
+                    if(patch_register_hook(base+0x1F346D0,&post_probe,first_island,0)) log("V4 PlayCorNext");
+                    else log("V4 failed");
+                }
+                goto probe_done;
+            }
+            if(!strcmp(probe,"24")) {
+                for(const auto& m:images) if(m.name=="main") {
+                    const auto base=reinterpret_cast<uintptr_t>(m.base);
+                    if(patch_register_hook(base+0x24D01B0,&ex_probe,first_island,0)) log("U1 FaderOnUpdate");
+                    else log("U1 failed");
+                    if(patch_register_hook(base+0x24CFD80,&nre_probe,first_island,0)) log("U2 FaderIsBusy");
+                    else log("U2 failed");
+                    if(patch_register_hook(base+0x1F34F70,&cb_reg_probe,first_island,0)) log("U3 SceneStartNext");
+                    else log("U3 failed");
+                    if(patch_register_hook(base+0x24D04C0,&post_probe,first_island,0)) log("U4 FadeIn");
+                    else log("U4 failed");
+                }
+                goto probe_done;
+            }
+            if(!strcmp(probe,"23")) {
+                for(const auto& m:images) if(m.name=="main") {
+                    const auto base=reinterpret_cast<uintptr_t>(m.base);
+                    if(patch_register_hook(base+0x1F34440,&ex_probe,first_island,0)) log("T1 OpLoadAndPlay");
+                    else log("T1 failed");
+                    if(patch_register_hook(base+0x1F34200,&nre_probe,first_island,0)) log("T2 OpLoad");
+                    else log("T2 failed");
+                    if(patch_register_hook(base+0x1F34F70,&cb_reg_probe,first_island,0)) log("T3 SceneStart");
+                    else log("T3 failed");
+                    if(patch_register_hook(base+0x2409280,&post_probe,first_island,0)) log("T4 MovieUpdate");
+                    else log("T4 failed");
+                }
+                goto probe_done;
+            }
+            if(!strcmp(probe,"22")) {
+                for(const auto& m:images) if(m.name=="main") {
+                    const auto base=reinterpret_cast<uintptr_t>(m.base);
+                    if(patch_register_hook(base+0x1F329D0,&ex_probe,first_island,0)) log("S1 DemoSceneStart");
+                    else log("S1 failed");
+                    if(patch_register_hook(base+0x2408BB0,&nre_probe,first_island,0)) log("S2 PlayStreaming");
+                    else log("S2 failed");
+                    if(patch_register_hook(base+0x1BF8AC0,&cb_reg_probe,first_island,0)) log("S3 NowLoadingClose");
+                    else log("S3 failed");
+                    if(patch_register_hook(base+0x20C7ED0,&post_probe,first_island,0)) log("S4 NowLoadingUpdate");
+                    else log("S4 failed");
+                }
+                goto probe_done;
+            }
+            if(!strcmp(probe,"21")) {
+                for(const auto& m:images) if(m.name=="main") {
+                    const auto base=reinterpret_cast<uintptr_t>(m.base);
+                    if(patch_register_hook(base+0x1C175E0,&ex_probe,first_island,0)) log("R1 SetStartTime");
+                    else log("R1 failed");
+                    if(patch_register_hook(base+0x1C176D8,&nre_probe,first_island,0)) log("R2 beforeSetTime");
+                    else log("R2 failed");
+                    if(patch_register_hook(base+0x2388B20,&cb_reg_probe,first_island,0)) log("R3 set_SystemData");
+                    else log("R3 failed");
+                    if(patch_register_hook(base+0x227AEE8,&post_probe,first_island,0)) log("R4 return");
+                    else log("R4 failed");
+                }
+                goto probe_done;
+            }
+            if(!strcmp(probe,"20")) {
+                for(const auto& m:images) if(m.name=="main") {
+                    const auto base=reinterpret_cast<uintptr_t>(m.base);
+                    if(patch_register_hook(base+0x1E0A870,&ex_probe,first_island,0)) log("Q1 GameManager.Initialize");
+                    else log("Q1 failed");
+                    if(patch_register_hook(base+0x1E0EA00,&nre_probe,first_island,0)) log("Q2 OnetimeInit.MoveNext");
+                    else log("Q2 failed");
+                    if(patch_register_hook(base+0x1E0B1D0,&cb_reg_probe,first_island,0)) log("Q3 GameManager.OnUpdate");
+                    else log("Q3 failed");
+                    if(patch_register_hook(base+0x1E09910,&prefs_ex_probe,first_island,0)) log("Q4 set_nowTime");
+                    else log("Q4 failed");
+                }
+                goto probe_done;
+            }
+            if(!strcmp(probe,"19")) {
+                for(const auto& m:images) if(m.name=="main") {
+                    const auto base=reinterpret_cast<uintptr_t>(m.base);
+                    if(patch_register_hook(base+0x26B6B40,&ex_probe,first_island,0)) log("P1 ThrowAOORE");
+                    else log("P1 failed");
+                    if(patch_register_hook(base+0x27E8AC0,&nre_probe,first_island,0)) log("P2 ToFileTimeUtc");
+                    else log("P2 failed");
+                    if(patch_register_hook(base+0x2388B20,&cb_reg_probe,first_island,0)) log("P3 set_SystemData");
+                    else log("P3 failed");
+                    if(patch_register_hook(base+0x189E670,&prefs_ex_probe,first_island,0)) log("P4 ExceptionCtor");
+                    else log("P4 failed");
+                }
+                goto probe_done;
+            }
+            if(!strcmp(probe,"18")) {
+                for(const auto& m:images) if(m.name=="main") {
+                    const auto base=reinterpret_cast<uintptr_t>(m.base);
+                    if(patch_register_hook(base+0x27E8A70,&nre_probe,first_island,0)) log("E1 ToFileTime x0");
+                    else log("E1 failed");
+                    if(patch_register_hook(base+0x2388B20,&cb_reg_probe,first_island,0)) log("E2 set_SystemData");
+                    else log("E2 failed");
+                    if(patch_register_hook(base+0x227AEE8,&post_probe,first_island,0)) log("E3 return");
+                    else log("E3 failed");
+                }
+                goto probe_done;
+            }
+            if(!strcmp(probe,"17")) {
+                for(const auto& m:images) if(m.name=="main") {
+                    const auto base=reinterpret_cast<uintptr_t>(m.base);
+                    if(patch_register_hook(base+0x26BB2B0,&ex_probe,first_island,0)) log("D1 get_Local");
+                    else log("D1 failed");
+                    if(patch_register_hook(base+0x27E8AC0,&nre_probe,first_island,0)) log("D2 ToFileTimeUtc");
+                    else log("D2 failed");
+                    if(patch_register_hook(base+0x2388B20,&cb_reg_probe,first_island,0)) log("D3 set_SystemData");
+                    else log("D3 failed");
+                    if(patch_register_hook(base+0x227AEE8,&post_probe,first_island,0)) log("D4 return");
+                    else log("D4 failed");
+                }
+                goto probe_done;
+            }
+            if(!strcmp(probe,"16")) {
+                for(const auto& m:images) if(m.name=="main") {
+                    const auto base=reinterpret_cast<uintptr_t>(m.base);
+                    if(patch_register_hook(base+0x238F000,&ex_probe,first_island,0)) log("C1 SetPlayerStatus");
+                    else log("C1 failed");
+                    if(patch_register_hook(base+0x1C175E0,&nre_probe,first_island,0)) log("C2 SetStartTime");
+                    else log("C2 failed");
+                    if(patch_register_hook(base+0x27E8A70,&prefs_ex_probe,first_island,0)) log("C3 ToFileTime");
+                    else log("C3 failed");
+                    if(patch_register_hook(base+0x1DEF080,&cb_reg_probe,first_island,0)) log("C4 ExistCheck");
+                    else log("C4 failed");
+                    if(patch_register_hook(base+0x227AEE8,&post_probe,first_island,0)) log("C5 return");
+                    else log("C5 failed");
+                }
+                goto probe_done;
+            }
+            if(!strcmp(probe,"15")) {
+                for(const auto& m:images) if(m.name=="main") {
+                    const auto base=reinterpret_cast<uintptr_t>(m.base);
+                    if(patch_register_hook(base+0x27E8A70,&nre_probe,first_island,0)) log("N1 ToFileTime");
+                    else log("N1 failed");
+                    if(patch_register_hook(base+0x19B7DA0,&prefs_ex_probe,first_island,0)) log("N2 AOORE");
+                    else log("N2 failed");
+                    if(patch_register_hook(base+0x1C175E0,&cb_reg_probe,first_island,0)) log("N3 SetStartTime");
+                    else log("N3 failed");
+                    if(patch_register_hook(base+0x238F2A8,&post_probe,first_island,0)) log("N4 late");
+                    else log("N4 failed");
+                }
+                goto probe_done;
+            }
+            if(!strcmp(probe,"14")) {
+                for(const auto& m:images) if(m.name=="main") {
+                    const auto base=reinterpret_cast<uintptr_t>(m.base);
+                    if(patch_register_hook(base+0x237DF80,&nre_probe,first_island,0)) log("M1 get_SystemData");
+                    else log("M1 failed");
+                    if(patch_register_hook(base+0x1C176D8,&prefs_ex_probe,first_island,0)) log("M2 beforeSetTime");
+                    else log("M2 failed");
+                    if(patch_register_hook(base+0x2388B20,&cb_reg_probe,first_island,0)) log("M3 set_SystemData");
+                    else log("M3 failed");
+                    if(patch_register_hook(base+0x1C178D0,&post_probe,first_island,0)) log("M4 SetDailyEventLastTime");
+                    else log("M4 failed");
+                }
+                goto probe_done;
+            }
+            if(!strcmp(probe,"13")) {
+                for(const auto& m:images) if(m.name=="main") {
+                    const auto base=reinterpret_cast<uintptr_t>(m.base);
+                    if(patch_register_hook(base+0x238F24C,&nre_probe,first_island,0)) log("K1 installed");
+                    else log("K1 failed");
+                    if(patch_register_hook(base+0x238F2A8,&prefs_ex_probe,first_island,0)) log("K2 installed");
+                    else log("K2 failed");
+                    if(patch_register_hook(base+0x238F2B0,&post_probe,first_island,0)) log("K3 installed");
+                    else log("K3 failed");
+                    if(patch_register_hook(base+0x1C175E0,&cb_reg_probe,first_island,0)) log("K4 installed");
+                    else log("K4 failed");
+                }
+                goto probe_done;
+            }
+            if(!strcmp(probe,"12")) {
+                for(const auto& m:images) if(m.name=="main") {
+                    const auto base=reinterpret_cast<uintptr_t>(m.base);
+                    if(patch_register_hook(base+0x238F110,&nre_probe,first_island,0)) log("H110 installed");
+                    else log("H110 failed");
+                    if(patch_register_hook(base+0x1E039B0,&prefs_ex_probe,first_island,0)) log("HFlag installed");
+                    else log("HFlag failed");
+                    if(patch_register_hook(base+0x1F54020,&cb_reg_probe,first_island,0)) log("HItem installed");
+                    else log("HItem failed");
+                    if(patch_register_hook(base+0x238F1B4,&post_probe,first_island,0)) log("H1B4 installed");
+                    else log("H1B4 failed");
+                }
+                goto probe_done;
+            }
+            if(!strcmp(probe,"11")) {
+                for(const auto& m:images) if(m.name=="main") {
+                    const auto base=reinterpret_cast<uintptr_t>(m.base);
+                    if(patch_register_hook(base+0x238F000,&nre_probe,first_island,0)) log("H1 SetPlayerStatus entry");
+                    else log("H1 failed");
+                    if(patch_register_hook(base+0x227AEE8,&cb_reg_probe,first_island,19)) log("H2 post-call");
+                    else log("H2 failed");
+                    if(patch_register_hook(base+0x1DEF080,&prefs_ex_probe,first_island,0)) log("H3 ExistCheck");
+                    else log("H3 failed");
+                    if(patch_register_hook(base+0x1F3E280,&post_probe,first_island,0)) log("H4 MoveNext control");
+                    else log("H4 failed");
+                }
+                goto probe_done;
+            }
+            if(!strcmp(probe,"10")) {
+                for(const auto& m:images) if(m.name=="main") {
+                    const auto base=reinterpret_cast<uintptr_t>(m.base);
+                    if(patch_register_hook(base+0x28C8BF0,&prefs_ex_probe,first_island,0)) log("PREFS_EX_HOOK installed");
+                    else log("PREFS_EX_HOOK failed");
+                    if(patch_register_hook(base+0x26990E0,&nre_probe,first_island,0)) log("NRE_HOOK installed");
+                    else log("NRE_HOOK failed");
+                    if(patch_register_hook(base+0x227AEE8,&cb_reg_probe,first_island,19)) log("REG_HOOK installed");
+                    else log("REG_HOOK failed");
+                }
+                goto probe_done;
+            }
+            if(!strcmp(probe,"9")) {
+                for(const auto& m:images) if(m.name=="main") {
+                    const auto base=reinterpret_cast<uintptr_t>(m.base);
+                    if(patch_register_hook(base+0x1DEF080,&ex_probe,first_island,0)) log("EX_HOOK installed");
+                    else log("EX_HOOK failed");
+                    if(patch_register_hook(base+0x1D1AD34,&post_probe,first_island,0)) log("POST_HOOK installed");
+                    else log("POST_HOOK failed");
+                    if(patch_register_hook(base+0x227AEE8,&cb_reg_probe,first_island,19)) log("REG_HOOK installed");
+                    else log("REG_HOOK failed");
+                }
+                goto probe_done;
+            }
+            if(!strcmp(probe,"8")) {
+                for(const auto& m:images) if(m.name=="main") {
+                    const auto base=reinterpret_cast<uintptr_t>(m.base);
+                    if(patch_pointer_hook(base+0x227AE60,&coro_ptr_probe,first_island)) log("PTR_HOOK b10_0 installed");
+                    else log("PTR_HOOK b10_0 failed");
+                }
+                goto probe_done;
+            }
+            if(!strcmp(probe,"7")) {
+                for(const auto& m:images) if(m.name=="main") {
+                    const auto base=reinterpret_cast<uintptr_t>(m.base);
+                    if(patch_register_hook(base+0x227AEE8,&cb_reg_probe,first_island,19)) log("REG_HOOK x19@0x227AEE8 installed");
+                    else log("REG_HOOK failed");
+                    if(patch_pointer_hook(base+0x1F3C090,&coro_ptr_probe,first_island)) log("PTR_HOOK callback installed");
+                    else log("PTR_HOOK callback failed");
+                }
+                goto probe_done;
+            }
+            if(!strcmp(probe,"6")) {
+                for(const auto& m:images) if(m.name=="main") {
+                    if(patch_pointer_hook(reinterpret_cast<uintptr_t>(m.base)+0x1F3C090,&coro_ptr_probe,first_island))
+                        log("PTR_HOOK callback installed");
+                    else log("PTR_HOOK callback failed");
+                }
+                goto probe_done;
+            }
+            if(!strcmp(probe,"5")) {
+                for(const auto& m:images) if(m.name=="main") {
+                    const auto base=reinterpret_cast<uintptr_t>(m.base);
+                    if(patch_pointer_hook(base+0x1F3E280,&coro_ptr_probe,first_island)) log("PTR_HOOK installed");
+                    else log("PTR_HOOK failed");
+                    uint32_t original;memcpy(&original,reinterpret_cast<void*>(base+0x238F000),4);
+                    if(patch_system(base+0x238F000,original,first_island,"PlayerWork_SetPlayerStatus",probe_hit))
+                        log("PROBE_INSTALLED PlayerWork_SetPlayerStatus");
+                    else log("PROBE_FAILED PlayerWork_SetPlayerStatus");
+                }
+                goto probe_done;
+            }
+            if(!strcmp(probe,"4")) {
+                for(const auto& m:images) if(m.name=="main") {
+                    if(patch_pointer_hook(reinterpret_cast<uintptr_t>(m.base)+0x1F3E280,&coro_ptr_probe,first_island))
+                        log("PTR_HOOK installed");
+                    else log("PTR_HOOK failed");
+                }
+                goto probe_done;
+            }
+            if(!strcmp(probe,"3")) {
+                for(const auto& m:images) if(m.name=="main") {
+                    const auto base=reinterpret_cast<uintptr_t>(m.base);
+                    if(patch_state_hook(base+0x1F3E280,coro_probe_slot,first_island,0x10))
+                        log("STATE_HOOK coro installed");
+                    else log("STATE_HOOK coro failed");
+                    if(patch_state_hook(base+0x189E670,exc_probe_slot,first_island,0x10))
+                        log("STATE_HOOK exc installed");
+                    else log("STATE_HOOK exc failed");
+                }
+                goto probe_done;
+            }
+            if(!strcmp(probe,"2")) {
+                for(const auto& m:images) if(m.name=="main") {
+                    /* Demo_Hakase.<PlayerSelect>d__17$$MoveNext：记录 <>1__state（+0x10）。 */
+                    const auto address=reinterpret_cast<uintptr_t>(m.base)+0x1F3E280;
+                    if(patch_state_hook(address,coro_probe_slot,first_island,0x10))
+                        log("STATE_HOOK installed at %#llx",(unsigned long long)address);
+                    else log("STATE_HOOK failed");
+                }
+                goto probe_done;
+            }
+            if(!strcmp(probe,"1")) for(const auto& m:images) if(m.name=="main") {
+                struct Probe { uint64_t rva; const char* name; } probes[]={
+                    {0x238F000,"PlayerWork_SetPlayerStatus"},
+                };
+                for(const auto& p:probes) {
+                    const auto address=reinterpret_cast<uintptr_t>(m.base)+p.rva;
+                    uint32_t original;memcpy(&original,reinterpret_cast<void*>(address),4);
+                    if(patch_system(address,original,first_island,p.name,probe_hit))
+                        log("PROBE_INSTALLED %s at %#llx",p.name,(unsigned long long)address);
+                    else log("PROBE_FAILED %s",p.name);
+                }
+            }
+        }
+    probe_done:;
+    }
     seal_tls_islands(first_island);
 }
 #include "guest_memory.inc"
@@ -203,11 +755,51 @@ void update_frame_rate(){
         if(applied_frame_rate.exchange(target)!=target)log("FRAME_RATE_POLICY applied=%d build=0d9649011312f62e clock=unchanged",target);
     }else if(applied_frame_rate.exchange(0)!=0)log("FRAME_RATE_POLICY unavailable result=%d",int(result));
 }
+/* SDK 在 TLS+0x1F8 存线程控制块指针，并读其 +0x1B0 作为线程标识（sdk+0x351890）。
+ * guest 自己用 msr 设置 TLS 时不会经过 guest_context_create，这里按需补一块。
+ * The SDK keeps a thread control block at TLS+0x1F8 and reads its +0x1B0 as the
+ * thread id; a guest that sets TLS via msr bypasses guest_context_create. */
+static void ot2_tls_ensure_control(GuestThread* c) {
+    if(!c||!c->guest_tls) return;
+    uint64_t cur=0; memcpy(&cur,reinterpret_cast<const void*>(c->guest_tls+0x1f8),8);
+    if(cur) return;
+    void* ctl=mmap(nullptr,0x400,PROT_READ|PROT_WRITE,MAP_PRIVATE|MAP_ANONYMOUS,-1,0);
+    if(ctl==MAP_FAILED) return;
+    uint32_t tid=0x1001u+uint32_t(c->handle&0xffffu);
+    memcpy(reinterpret_cast<uint8_t*>(ctl)+0x1b0,&tid,4);
+    uint64_t ptr=reinterpret_cast<uintptr_t>(ctl);
+    memcpy(reinterpret_cast<void*>(c->guest_tls+0x1f8),&ptr,8);
+}
+bool capture_guest_thread_context(const ucontext_t* uc,const GuestThread* c,GuestThreadContextImage& out) {
+    const auto& m=uc->uc_mcontext;
+    for(unsigned i=0;i<29;i++)out.gprs[i]=m.regs[i];
+    out.fp=m.regs[29];out.lr=m.regs[30];out.sp=m.sp;
+    out.pc=m.pc+4;out.psr=uint32_t(m.pstate);out.tpidr=c->guest_tls;
+    const auto* records=m.__reserved;
+    size_t offset=0;
+    while(offset+sizeof(_aarch64_ctx)<=sizeof(m.__reserved)) {
+        const auto* record=reinterpret_cast<const _aarch64_ctx*>(records+offset);
+        if(record->size<sizeof(*record)||record->size>sizeof(m.__reserved)-offset)break;
+        if(record->magic==FPSIMD_MAGIC && record->size>=sizeof(fpsimd_context)) {
+            const auto* fp_context=reinterpret_cast<const fpsimd_context*>(record);
+            memcpy(out.fpu_gprs,fp_context->vregs,sizeof(out.fpu_gprs));
+            out.fpcr=fp_context->fpcr;out.fpsr=fp_context->fpsr;
+            return true;
+        }
+        offset+=record->size;
+    }
+    return false;
+}
 void svc(unsigned id,ucontext_t* uc,GuestThread* c) {
     auto* r=uc->uc_mcontext.regs;
+    /* 环形记录最近 SVC（纯内存写，无锁）：卡住时主线程到底在循环什么。 */
+    /* Ring-record the latest SVCs (memory writes only): what does the main thread loop on while stalled. */
+    ot2_thread_record_svc(id,uc->uc_mcontext.sp,r[30],r[0],r[1]);
+    if(id==0x1c) ot2_thread_record_sample_sp(uc->uc_mcontext.sp);
     static std::atomic<unsigned long> svc_seq{0};
     const unsigned long svc_n=svc_seq.fetch_add(1,std::memory_order_relaxed);
-    if(svc_n<400000) log("SVC#%lu 0x%x x0=%llx x1=%llx x2=%llx x3=%llx",svc_n,id,r[0],r[1],r[2],r[3]);
+    if(svc_n<400000) log("SVC#%lu 0x%x thread=%#llx tls=%#llx tlr=%#llx x0=%llx x1=%llx x2=%llx x3=%llx",svc_n,id,
+        (unsigned long long)c->handle,(unsigned long long)c->guest_tls,(unsigned long long)c->guest_tlr,r[0],r[1],r[2],r[3]);
     if(id==0x1e) { r[0]=ticks(); return; }
     if(id==0x15 || id==0x51 || id==0x52) {
         std::lock_guard lock(mapping_mutex);
@@ -257,9 +849,26 @@ void svc(unsigned id,ucontext_t* uc,GuestThread* c) {
             return;
         }
     }
+    /* WaitProcessWideKeyAtomic 的 sp 已在 svc() 入口记录（见上方 ot2_thread_record_svc 段）。 */
+    /* WaitProcessWideKeyAtomic's sp is recorded at the svc() entry (see the
+     * ot2_thread_record_svc section above). */
     if(thread_system_ready && svc_thread(id,reinterpret_cast<uint64_t*>(r))) return;
     if(id==0x10) { r[0]=0; return; }
-    if(id==0x25) { r[0]=0;r[1]=c->handle;return; }
+    if(id==0x25) {
+        /* GetThreadId(handle)：必须按**传入的句柄**返回对应线程的 id，
+         * 否则 SDK 为别的线程建的线程对象会带上当前线程 id，
+         * 导致「某对象是否是当前线程」的判断恒为真。
+         * GetThreadId(handle) must report the thread named by the handle, otherwise
+         * thread objects get the caller's id and "is this the current thread"
+         * always evaluates true. */
+        const uint32_t requested=static_cast<uint32_t>(r[1]);
+        uint64_t out=c->handle;
+        if(requested && requested!=0xffff8001u) {
+            for(unsigned i=0;i<GuestThreadCapacity;i++)
+                if(static_cast<uint32_t>(ot2_threads[i].handle)==requested){ out=ot2_threads[i].handle; break; }
+        }
+        r[0]=0; r[1]=out; return;
+    }
     if(id==0x0c) { r[0]=0;r[1]=44;return; }
     if(id==0x0e) { r[0]=0;r[1]=0;r[2]=1;return; }
     if(id==0x27) { log("GUEST %.*s",int(std::min<uint64_t>(r[1],1600)),reinterpret_cast<char*>(r[0]));r[0]=0;return; }
@@ -328,7 +937,192 @@ void svc(unsigned id,ucontext_t* uc,GuestThread* c) {
         std::lock_guard lock(mapping_mutex);r[0]=memory_resize_heap(r[1]);
         if(!r[0])r[1]=reinterpret_cast<uintptr_t>(address_space)+heap_offset;return;
     }
-    if(id==0x26) { log("Guest Break reason=%llx detail=%llx size=%llx",r[0],r[1],r[2]);fail("Guest SDK abort",uc); }
+    /* Unity 的 SDK 在初始化时用 0x1f 取一个 32 位值（返回值放在 x1）。
+     * The Unity SDK reads a 32-bit value through 0x1f during startup (result in x1). */
+    if(id==0x1f) {
+        auto* t=ot2_guest_context_current();
+        ot2_tls_ensure_control(t);
+        const char* name=reinterpret_cast<const char*>(r[1]?r[1]:0);
+        log("CONNECT_NAMED_PORT name=%s", name?name:"?");
+        r[0]=0; r[1]=0x200; return;
+    }
+    /* 线程属性查询：0x21 = 本线程、0x22 = 指定线程、0x23 返回值放 x1。
+     * Thread attribute queries: 0x21 self, 0x22 handle, 0x23 returns in x1. */
+    if(id==0x21) {
+        /* sm: 服务管理器 HLE。请求区可能落在 TLR+0（服务名或 CMIF）或
+         * TLR+0x20（域请求），两种都处理：
+         *   1) 以 "SFCI" 开头 → CMIF 事务，回 SFCO + 域头
+         *   2) 以可打印 ASCII 开头（如 "fsp-srv"）→ GetService，
+         *      回一个移动句柄并登记；该句柄后续的请求一律成功返回。
+         * sm: service-manager HLE covering both CMIF transactions and inline
+         * GetService name requests. */
+        auto* t=ot2_guest_context_current();
+        if(t && t->guest_tlr) {
+            uint8_t* b=reinterpret_cast<uint8_t*>(t->guest_tlr);
+            if(svc_n<220) {
+                uint32_t words[12]{};
+                memcpy(words,b,sizeof(words));
+                log("IPC_REQUEST thread=%#llx handle=%#llx hdr=%08x/%08x/%08x/%08x body=%08x/%08x/%08x/%08x tail=%08x/%08x/%08x/%08x",
+                    (unsigned long long)t->handle,(unsigned long long)r[0],
+                    words[0],words[1],words[2],words[3],words[4],words[5],words[6],words[7],words[8],words[9],words[10],words[11]);
+            }
+            uint8_t* m=b+0x20;                       /* 请求体固定落在 TLR+0x20 */
+            const uint32_t* q8=reinterpret_cast<const uint32_t*>(m);
+            const uint32_t* q=reinterpret_cast<const uint32_t*>(b);
+            const uint32_t message_type=q[0]&0xffffu;
+            if(message_type==5u || message_type==7u) {
+                /* CMIF control requests use an aligned header at +0x10. */
+                const uint32_t command=q[6];
+                if(command!=0u && command!=3u) {
+                    log("UNHANDLED_IPC_CONTROL handle=%#llx command=%u",(unsigned long long)r[0],command);
+                    r[0]=0xe401; return;
+                }
+                uint32_t* w=reinterpret_cast<uint32_t*>(b);
+                w[0]=0u; w[1]=9u; w[2]=0u; w[3]=0u;
+                w[4]=0x4F434653u; w[5]=0u; w[6]=0u; w[7]=0u;
+                w[8]=command==0u ? 1u : 0u; /* domain object ID / pointer-buffer size */
+                log("IPC_CONTROL handle=%#llx command=%u value=%u",
+                    (unsigned long long)r[0],command,w[8]);
+                r[0]=0; return;
+            }
+            if(r[0]==0x800 && (message_type==4u || message_type==6u)) {
+                size_t data_offset=8;
+                if(q[1]&0x80000000u) {
+                    const uint32_t special=q[2];
+                    data_offset+=4;
+                    if(special&1u) data_offset+=8;
+                    data_offset+=4*((special>>1)&0xfu);
+                    data_offset+=4*((special>>5)&0xfu);
+                }
+                data_offset=(data_offset+15u)&~size_t(15u);
+                if(data_offset+32u<=0x200u) {
+                    uint32_t* domain=reinterpret_cast<uint32_t*>(b+data_offset);
+                    uint32_t* cmif=domain+4;
+                    if((domain[0]&0xffu)==1u && domain[1]==1u && cmif[0]==0x49434653u) {
+                        const uint32_t command=cmif[2];
+                        if(command!=1u && command!=1005u) {
+                            log("UNHANDLED_FSP_DOMAIN command=%u",command);
+                            r[0]=0xe401; return;
+                        }
+                        uint32_t* w=reinterpret_cast<uint32_t*>(b);
+                        /* With no special header the data starts at +8, is aligned
+                         * to +16, and the word count covers the aligned payload. */
+                        w[0]=0u; w[1]=command==1005u ? 13u : 12u;
+                        w[2]=0u; w[3]=0u; /* HIPC alignment padding */
+                        w[4]=0u; w[5]=0u; w[6]=0u; w[7]=0u; /* no returned domain objects */
+                        w[8]=0x4F434653u; w[9]=0u; w[10]=0u; w[11]=0u;
+                        w[12]=0u; /* GetGlobalAccessLogMode: disabled */
+                        log("FSP_DOMAIN command=%u",command);
+                        r[0]=0; return;
+                    }
+                }
+                log("UNHANDLED_FSP_REQUEST type=%u offset=%zu",message_type,data_offset);
+                r[0]=0xe401; return;
+            }
+            const bool is_cmif = q8[0]==0x49434653u;
+            bool is_name=false; char name[9]={0};
+            if(!is_cmif) {
+                for(int i=0;i<8;i++){ uint8_t ch=m[i];
+                    if(!ch) break;
+                    if(ch<32||ch>126){ is_name=false; break; }
+                    name[i]=char(ch); is_name=true; }
+            }
+            if(r[0]==0x200 && is_name) {
+                static uint32_t next_handle=0x800;
+                const uint32_t h=next_handle++;
+                log("SM_GETSERVICE name=%s handle=%#x",name,h);
+                uint32_t* hw=reinterpret_cast<uint32_t*>(b);
+                hw[0]=0u;                 /* tag = 0（响应） */
+                hw[1]=4u|0x80000000u;     /* CMIF out(4), has_special=1 */
+                hw[2]=0x20u;              /* special: num_move_handles=1 */
+                hw[3]=h;                  /* 移动出来的会话句柄 */
+                uint32_t* c=reinterpret_cast<uint32_t*>(b+0x10);
+                c[0]=0x4F434653u; c[1]=0u; c[2]=0u; c[3]=0u;
+            } else {
+                uint32_t req_ver=0;
+                const uint32_t* r30=reinterpret_cast<const uint32_t*>(b+0x30);
+                if(q8[0]==0x49434653u) req_ver=q8[1];
+                else if(r30[0]==0x49434653u) req_ver=r30[1];
+                else if(q[0]==0x49434653u) req_ver=q[1];
+                uint32_t* w=reinterpret_cast<uint32_t*>(b);
+                w[0]=0u; w[1]=8u|0x80000000u;   /* tag=0, ndata=8, has_special=1 */
+                w[2]=0u;                         /* special: 无句柄移动 */
+                uint32_t* c=reinterpret_cast<uint32_t*>(b+0x10);
+                c[0]=0x4F434653u; c[1]=req_ver; c[2]=0u; c[3]=0u;
+                uint32_t* d=reinterpret_cast<uint32_t*>(b+0x20);
+                d[0]=1u; d[1]=0u; d[2]=0u; d[3]=0u;
+            }
+            log("REPLY_CHECK tlr=%#llx w10=%08x w14=%08x w20=%08x",
+                (unsigned long long)t->guest_tlr,
+                *reinterpret_cast<const uint32_t*>(b+0x10),
+                *reinterpret_cast<const uint32_t*>(b+0x14),
+                *reinterpret_cast<const uint32_t*>(b+0x20));
+        }
+        r[0]=0; return;
+    }
+    if(id==0x22) { r[0]=0; return; }
+    if(id==0x23) { r[0]=0; r[1]=0; return; }
+    /* 0x36 = GetThreadLocalRegion：把本线程的 TLS 地址写回给调用方。
+     * 0x36 = GetThreadLocalRegion: report this thread's TLS address. */
+    if(id==0x36) {
+        /* 0x36 = GetThreadLocalRegion。SDK 在 TLS+0x1F8 存一个指向线程控制块的指针，
+         * 其 +0x1B0 是当前线程标识（用于判断「某个对象是不是当前线程」）。
+         * 运行时没初始化它，会让该判断恒为真而触发断言，这里补上。
+         * The SDK keeps a thread-control pointer at TLS+0x1F8 whose +0x1B0 is the
+         * current thread id; without it the "is this the current thread" check
+         * degenerates to true and an assert fires. */
+        if(c->guest_tls) {
+            uintptr_t tls=c->guest_tls;
+            uintptr_t scratch=tls+0x800;
+            uint64_t cur=0; memcpy(&cur,reinterpret_cast<const void*>(tls+0x1f8),8);
+            if(cur!=scratch) {
+                memcpy(reinterpret_cast<void*>(tls+0x1f8),&scratch,8);
+                uint32_t tid=uint32_t(c->handle&0xffffffffu);
+                memcpy(reinterpret_cast<void*>(scratch+0x1b0),&tid,4);
+            }
+        }
+        r[0]=c->guest_tls; return;
+    }
+    if(id==0x26) {
+        /* 把 detail 指向的内容打印出来：SDK 的断言信息常常就放在那里。
+         * Dump the detail bytes: the SDK assertion payload usually lives there. */
+        log("Guest Break reason=%llx detail=%llx size=%llx",r[0],r[1],r[2]);
+        if(r[1] && r[2] && r[2] <= 256) {
+            const uint8_t* d=reinterpret_cast<const uint8_t*>(r[1]);
+            char hex[3*64+1]={0}; char ascii[65]={0};
+            size_t n=r[2]>48?48:size_t(r[2]);
+            for(size_t i=0;i<n;i++){snprintf(hex+i*3,4,"%02x ",d[i]);ascii[i]=(d[i]>=32&&d[i]<127)?char(d[i]):'.';}
+            log("Guest Break detail hex=%s",hex);log("Guest Break detail ascii=%s",ascii);
+        }
+        /* 诊断：用 sdk 模块的宿主基址读失败单例的 vtable 与方法。 */
+        { uintptr_t base=0, size=0;
+          for(const auto& m:images) if(m.name=="sdk"){ base=reinterpret_cast<uintptr_t>(m.base); size=m.size; }
+          auto gp=[&](uint64_t a)->uint64_t{ uint64_t v=0;
+              if(!base||a+8>size) return 0;
+              memcpy(&v,reinterpret_cast<const void*>(base+a),8); return v; };
+          auto hp=[&](uint64_t a)->uint64_t{ uint64_t v=0; if(!a) return 0;
+              memcpy(&v,reinterpret_cast<const void*>(a),8); return v; };
+          uint64_t slot=gp(0xd030d8ull);
+          uint64_t obj=hp(slot);
+          uint64_t vt=obj?hp(obj):0;
+          uint64_t m2=vt?hp(vt+0x20):0;   /* 空指针保护：vt=0 时原来会二次崩溃，盖掉真正的断言信息 */
+          log("SINGLETON base=%#llx slot=%#llx obj=%#llx vtable=%#llx method=%#llx",
+              (unsigned long long)base,slot,obj,vt,m2); }
+        /* 诊断：dump TLS+0x1F8 及其 +0x1B0 字段。 */
+        { uint64_t tls=c->guest_tls, ptr=0, field=0;
+          if(tls) memcpy(&ptr,reinterpret_cast<const void*>(tls+0x1f8),8);
+          if(ptr) memcpy(&field,reinterpret_cast<const void*>(ptr+0x1b0),4);
+          log("TLS_STATE tls=%#llx ptr=%#llx field=%#x",(unsigned long long)tls,(unsigned long long)ptr,(unsigned)field); }
+        /* 诊断：dump 栈顶原始字，把落在模块内的返回地址列出来（比帧指针链可靠）。 */
+        { uintptr_t sp=uc->uc_mcontext.sp;
+          log("STACK_RAW sp=%#llx",(unsigned long long)sp);
+          for(unsigned i=0;i<48;i++){ uint64_t v=0;
+              memcpy(&v,reinterpret_cast<const void*>(sp+i*8),8);
+              for(const auto& m:images){ auto b=reinterpret_cast<uintptr_t>(m.base);
+                  if(v>=b&&v<b+m.size){ log("  [sp+%#x] %s+0x%llx",i*8,m.name.c_str(),(unsigned long long)(v-b)); break; } }
+          } }
+        fail("Guest SDK abort",uc);
+    }
     log("Unimplemented SVC 0x%x",id); fail("Required system call unavailable",uc);
 }
 }
@@ -477,9 +1271,31 @@ extern "C" void* ot2_native_gate(const char* name,void* function) {
     native_gate_count.store(count+1,std::memory_order_release);
     return native_gate_code+count*32;
 }
+extern "C" void ot2_gate_ring_log(void){
+    const unsigned pos=gate_ring_pos.load(std::memory_order_relaxed);
+    const unsigned count=std::min<unsigned>(pos,gate_ring_capacity);
+    const unsigned total=native_gate_count.load(std::memory_order_acquire);
+    log("GATE_RING count=%u pos=%u",count,pos);
+    for(unsigned i=0;i<count;i++){
+        const unsigned index=gate_ring[(pos-count+i)%gate_ring_capacity].load(std::memory_order_relaxed);
+        log("  GATE %s",index<total?native_gates[index].name:"?");
+    }
+    const unsigned spos=service_pos.load(std::memory_order_relaxed);
+    const unsigned scount=std::min<unsigned>(spos,service_ring_capacity);
+    log("SERVICE_RING count=%u pos=%u",scount,spos);
+    for(unsigned i=0;i<scount;i++){
+        const char* name=service_ring[(spos-scount+i)%service_ring_capacity];
+        log("  SERVICE %s",name?name:"?");
+    }
+}
 extern "C" void* ot2_native_function(unsigned index){
     if(index>=native_gate_count.load(std::memory_order_acquire))fail("Native gate index invalid");
-    auto& gate=native_gates[index];if(__atomic_fetch_add(&gate.hits,1,__ATOMIC_RELAXED)==0)log("NATIVE %s",gate.name);
+    auto& gate=native_gates[index];
+    /* 环形里跳过 NVN 图形调用：每帧上万条会把真正要看的系统服务（hid/oe/fs/applet）冲掉。 */
+    /* Skip NVN graphics calls in the ring: tens of thousands per frame would flush out the system services (hid/oe/fs/applet) we want to see. */
+    if(strncmp(gate.name,"nvn",3)!=0)
+        gate_ring[gate_ring_pos.fetch_add(1,std::memory_order_relaxed)%gate_ring_capacity].store(index,std::memory_order_relaxed);
+    if(__atomic_fetch_add(&gate.hits,1,__ATOMIC_RELAXED)==0)log("NATIVE %s",gate.name);
     if(gate.present)update_frame_rate();
     if(!gate.function){log("Missing native API: %s",gate.name);fail("Required native API unavailable");}return gate.function;
 }
@@ -500,7 +1316,15 @@ extern "C" void dm_thread_enter(uint64_t entry,uint64_t argument,uint64_t stack_
 }
 extern "C" void ot2_signal_handler(int sig,siginfo_t* info,void* raw) {
     auto* uc=static_cast<ucontext_t*>(raw);
-    if(sig==SIGPROF){ ot2_thread_record_sample(uc->uc_mcontext.pc); return; }
+    if(sig==SIGPROF){
+        const uintptr_t pc=uc->uc_mcontext.pc;
+        bool in_module=false;
+        for(const auto& m:images){ auto b=reinterpret_cast<uintptr_t>(m.base);
+            if(pc>=b&&pc<b+m.size){ in_module=true; break; } }
+        /* 只有在 guest 代码里采样时才记录 sp：否则采到的是宿主栈。 */
+        ot2_thread_record_sample(pc);
+        if(in_module) ot2_thread_record_sample_sp(uc->uc_mcontext.sp);
+        return; }
     if(sig==SIGSEGV && (info->si_code==SEGV_ACCERR||info->si_code==SEGV_MAPERR)){
         // Linux exposes the ARM64 data-abort ESR in the signal context. Only
         // write faults may be handled by dirty tracking; never swallow execute
@@ -538,6 +1362,10 @@ extern "C" void ot2_signal_handler(int sig,siginfo_t* info,void* raw) {
     if(!found) fail("Unregistered breakpoint",uc);
     if(found->hook) {
         sdk_signal_count.fetch_add(1,std::memory_order_relaxed);
+        /* 记录最近命中的宿主服务（跳过 nvn*，那是图形门）：看卡住时游戏还在轮询哪些 SDK 服务。 */
+        /* Record recently hit host services (skip nvn*, those are graphics gates): shows which SDK services the game still polls while stalled. */
+        if(strncmp(found->hook,"nvn",3)!=0)
+            service_ring[service_pos.fetch_add(1,std::memory_order_relaxed)%service_ring_capacity]=found->hook;
         if(__atomic_fetch_add(&found->hits,1,__ATOMIC_RELAXED)==0) log("HOST %s",found->hook);
         if(found->call) {
             auto* previous=active_signal;active_signal=uc;
@@ -550,8 +1378,18 @@ extern "C" void ot2_signal_handler(int sig,siginfo_t* info,void* raw) {
     auto op=found->instruction;auto target=op&31;auto kind=op&~31U;
     if(kind==0xd53bd040||kind==0xd53bd060||kind==0xd51bd040)tls_signal_count.fetch_add(1,std::memory_order_relaxed);
     auto* r=uc->uc_mcontext.regs;
-    if((op&0xffe0001f)==0xd4000001) {svc_signal_count.fetch_add(1,std::memory_order_relaxed);svc((op>>5)&0xffff,uc,c);}
-    else if(kind==0xd51bd040) c->guest_tls=target==31?0:r[target];
+    if((op&0xffe0001f)==0xd4000001) {
+        svc_signal_count.fetch_add(1,std::memory_order_relaxed);
+        int captured=0;
+        if(thread_system_ready) {
+            GuestThreadContextImage snapshot{};
+            if(capture_guest_thread_context(uc,c,snapshot))
+                captured=svc_thread_capture_context(&snapshot,sizeof(snapshot));
+        }
+        svc((op>>5)&0xffff,uc,c);
+        if(captured)svc_thread_release_context();
+    }
+    else if(kind==0xd51bd040) { c->guest_tls=target==31?0:r[target]; ot2_tls_ensure_control(c); }
     else if(target!=31) {
         switch(kind) {
         case 0xd53bd040:r[target]=c->guest_tls;break;
@@ -675,9 +1513,20 @@ void boot_game(const std::string& directory,const std::string& log_path,uint64_t
     auto* c=create_thread_context();install_handlers();
     address_space=static_cast<uint8_t*>(mmap(nullptr,reserve_size,PROT_NONE,MAP_PRIVATE|MAP_ANONYMOUS,-1,0));
     if(address_space==MAP_FAILED) fail("Address space reserve failed");
+    log("ENGINE adapter=%s",ot2::engine_name());
+    log("PATCHES configured=%d list=%s",ot2::patch_list_configured()?1:0,ot2::patch_list_text());
     log("MAIN_INIT_BEGIN");c->handle=svc_thread_main_init();log("MAIN_INIT_DONE h=%#x",c->handle);thread_system_ready=true;
     LoadedGame game(directory);active_game=&game;memory_registry_changed();images=game.modules();
-    for(const auto& m:images)if(m.name=="main")frame_rate_patch.configure(reinterpret_cast<uintptr_t>(m.base),m.size,m.build_id);
+    // 引擎适配层：UE4 的帧率通过 CVar 运行库补丁实现（按构建 ID 精确匹配）；
+    // 非 UE4 引擎没有这条路径，跳过并明确记录，避免“静默无效”。
+    for(const auto& m:images)if(m.name=="main"){
+        if(ot2::engine_kind()==ot2::Engine::ue4){
+            frame_rate_patch.configure(reinterpret_cast<uintptr_t>(m.base),m.size,m.build_id);
+            log("FRAMERATE_PATCH engine=ue4 build=%s",frame_rate_patch.supported()?"supported":"unmatched");
+        }else{
+            log("FRAMERATE_PATCH skipped engine=%s patch=none",ot2::engine_name());
+        }
+    }
     for(auto& m:images) { image_size+=m.size;patch(m.base+m.text_offset,m.text_size);log("Module %s base=%p size=%zu",m.name.c_str(),m.base,m.size); }
     install_service_initializers(game);
     game.make_executable();log("Patched %zu system boundaries; running ARM64 directly",traps.size());

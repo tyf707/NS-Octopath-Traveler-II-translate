@@ -122,6 +122,9 @@ def build(args):
         if main['build_id'] not in profile['main_build_ids']:
             raise ValueError('Unknown main build ID; refusing game-specific assumptions')
         game_profile.update(name=metadata['name'], dlc=metadata['dlc'])
+        # 按标题的补丁由 profile 声明，运行时不再按标题猜。
+        if 'patches' in profile:
+            game_profile['patches'] = profile['patches']
         (game / 'game-build.json').write_text(json.dumps(game_profile, indent=2) + '\n')
         if args.shader_cache:
             shader_root = outside(args.shader_cache)

@@ -9,7 +9,7 @@
 struct CacheBudget {
     static constexpr uint64_t MiB=1024*1024;
     size_t descriptors=8192,texel_views=8192;
-    size_t geometry_bytes=64*MiB,geometry_entries=2048;
+    size_t geometry_bytes=128*MiB,geometry_entries=4096;
     size_t free_buffer_bytes=128*MiB,free_buffers=128;
     size_t resource_bytes=64*MiB,resource_entries=8192;
     uint64_t allowance=0,reserve=0;

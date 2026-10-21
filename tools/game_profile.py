@@ -33,7 +33,12 @@ def make_profile(root, title_id, version=0, display_version=''):
     # serves the original bytes; it has no Unreal or Halley extraction dependency.
     romfs = root / 'RomFS'
     engine = 'generic'
-    if any(romfs.rglob('*.pak')):
+    # Cheap Unity markers first: their content directories identify the engine
+    # without walking the whole tree looking for Unreal paks.
+    unity_markers = ('Data/Managed', 'Data/globalgamemanagers', 'Data/StreamingAssets')
+    if any((romfs / marker).exists() for marker in unity_markers):
+        engine = 'unity'
+    elif any(romfs.rglob('*.pak')):
         engine = 'unreal'
     else:
         for path in romfs.rglob('shaders.dat'):

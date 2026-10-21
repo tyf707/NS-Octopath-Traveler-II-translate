@@ -10,14 +10,30 @@
 #endif
 #include <atomic>
 #include <cstring>
+#ifdef __ANDROID__
+#include <sys/system_properties.h>
+#endif
 #include <mutex>
 namespace {
 std::mutex pad_mutex;uint64_t buttons{},presses{};int32_t lx{},ly{},rx{},ry{};std::atomic<int64_t> sampling{};std::atomic<bool> input_trace{false};
 struct PadState {int64_t sample;uint64_t buttons;int32_t lx,ly,rx,ry;uint32_t attributes,padding;};
 static_assert(sizeof(PadState)==40);
 using R=uint64_t*;
-uint64_t pad(R r){auto& out=*reinterpret_cast<PadState*>(r[0]);out={};out.sample=++sampling;if(*reinterpret_cast<const uint32_t*>(r[1])==0x20){std::lock_guard lock(pad_mutex);out.attributes=3;out.buttons=buttons|presses;if(input_trace && (out.buttons&8))ot2_host_log("HID_INPUT_Y sample=%lld buttons=%llx",(long long)out.sample,(unsigned long long)out.buttons);presses=0;out.lx=lx;out.ly=ly;out.rx=rx;out.ry=ry;}return 0;}
+uint64_t pad(R r){auto& out=*reinterpret_cast<PadState*>(r[0]);out={};out.sample=++sampling;
+#ifdef __ANDROID__
+    /* debug.ot2.trace=1 打开输入日志（不需要改 Java）。 */
+    /* debug.ot2.trace=1 enables input logging without touching Java. */
+    static std::atomic<int> trace_checked{0};
+    if(!input_trace.load() && !trace_checked.exchange(1)){char v[PROP_VALUE_MAX]{};if(__system_property_get("debug.ot2.trace",v)>0)input_trace.store(true);}
+#endif
+    if(*reinterpret_cast<const uint32_t*>(r[1])==0x20){std::lock_guard lock(pad_mutex);out.attributes=3;out.buttons=buttons|presses;if(input_trace && out.buttons)ot2_host_log("HID_PAD sample=%lld buttons=%llx",(long long)out.sample,(unsigned long long)out.buttons);presses=0;out.lx=lx;out.ly=ly;out.rx=rx;out.ry=ry;}return 0;}
 uint64_t absent_pad(R r){auto& out=*reinterpret_cast<PadState*>(r[0]);out={};out.sample=++sampling;return 0;}
+uint64_t pad_states(R r){
+    if(!r[0] || static_cast<int32_t>(r[1])<=0)return 0;
+    uint64_t args[2]={r[0],r[2]};
+    pad(args);
+    return 1;
+}
 // Fixed capacity: at most 16 guest fingers and four pending gestures per
 // finger. Moves coalesce; a quick down/up remains Start then End across reads.
 struct TouchPoint {int64_t delta;uint32_t attributes,id;int32_t x,y,dx,dy,angle,reserved;};
@@ -104,6 +120,9 @@ namespace ot2 {
 const std::vector<HostService>& input_services(){static const std::vector<HostService> table={
     {"_ZN2nn3hid15GetNpadStyleSetERKj",[](R r)->uint64_t{return *reinterpret_cast<const uint32_t*>(r[0])==0x20?2:0;}},
     {"_ZN2nn3hid12GetNpadStateEPNS0_17NpadHandheldStateERKj",pad},
+    {"_ZN2nn3hid12GetNpadStateEPNS0_21NpadHandheldLarkStateERKj",pad},
+    {"_ZN2nn3hid13GetNpadStatesEPNS0_17NpadHandheldStateEiRKj",pad_states},
+    {"_ZN2nn3hid13GetNpadStatesEPNS0_21NpadHandheldLarkStateEiRKj",pad_states},
     {"_ZN2nn3hid12GetNpadStateEPNS0_16NpadFullKeyStateERKj",absent_pad},
     {"_ZN2nn3hid12GetNpadStateEPNS0_16NpadJoyDualStateERKj",absent_pad},
     {"_ZN2nn3hid12GetNpadStateEPNS0_16NpadJoyLeftStateERKj",absent_pad},

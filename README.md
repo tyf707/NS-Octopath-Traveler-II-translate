@@ -134,6 +134,19 @@ Inspect NSP metadata or verify a generated resource bundle:
 
 The packaging tools are in `s2a/`, the Android app in `app/`, the native runtime and Vulkan backend in `native/`, and the offline shader tools in `tools/`.
 
+### Shader adapters
+
+Shaders compiled for Horizon are recovered from the retail data and translated to SPIR-V ahead of time. Which adapter runs is chosen by the profile's `resource_adapter`:
+
+| Engine | Source of the NVN binaries | Adapter |
+|---|---|---|
+| Unreal Engine | `RomFS/**/*.pak` plus `GlobalShaderCache-SF_GLSL_SWITCH.bin` | `tools/extract_shaders.py` |
+| Unity | `Shader.compressedBlob` inside UnityFS bundles | `tools/extract_unity_shaders.py` |
+
+Unity keeps each platform's compiled programs in a compressed sub-program blob. On Switch those programs are NVN shader binaries framed as `[u32 control_size][u32 code_size][control][code]` — the sizes precede the control block, whereas the Unreal framing has the code first. The extractor walks the bundles, decompresses the blob for the Switch platform, carves every well-formed binary and writes `{key}.control/.code/.asm` for the offline translator. As with Unreal data, the key is the FNV-1a hash of the control block, so it matches what the runtime computes at draw time. Unity control blocks also carry their assembly text, but retail builds strip it; an empty `.asm` means the texture and image slot tables cannot be inferred, so the translator runs with empty bindings.
+
+A profile whose `resource_adapter` is `generic` uses neither adapter; that is the correct setting for engines whose shaders cannot be recovered this way.
+
 To run the checks without game files:
 
 ```sh

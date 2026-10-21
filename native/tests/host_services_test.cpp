@@ -13,6 +13,7 @@
 extern "C" void ot2_host_stream_profile(int);
 
 extern "C" void ot2_host_log(const char*,...) {}
+extern "C" uint64_t ot2_call_guest_address(uint64_t,const uint64_t*) {throw std::runtime_error("Unexpected guest address call");}
 extern "C" [[noreturn]] void ot2_host_die(const char*,...) {throw std::runtime_error("Unexpected native failure");}
 static uintptr_t created_event=0;static bool event_signaled=false;
 extern "C" uint64_t ot2_call_guest(const char* name,const uint64_t* r) {
@@ -34,6 +35,8 @@ uint64_t call(const char* name,std::initializer_list<uint64_t> args){
 }
 void require(bool value,const char* message){if(!value)throw std::runtime_error(message);}
 int main(){
+    for(const auto& service:ot2::host_services())require(strcmp(service.name,"_ZN2nn3ngc15ProfanityFilter10InitializeEPvmb"),"Real SDK must initialize filter from mounted system data");
+    for(const auto& service:ot2::host_services())require(strcmp(service.name,"_ZN2nn3ngc15ProfanityFilterC1Ev")&&strcmp(service.name,"_ZN2nn3ngc15ProfanityFilterD1Ev")&&strcmp(service.name,"_ZN2nn3ngc15ProfanityFilter24MaskProfanityWordsInTextEPiPtj"),"Polymorphic filter lifecycle and checks remain in SDK");
     char temporary[]="/tmp/ot2-filesystem-XXXXXX";auto* directory=mkdtemp(temporary);if(!directory)return 2;
     struct Cleanup {std::string path;~Cleanup(){std::filesystem::remove_all(path);}} cleanup{directory};
     std::string base=directory;std::filesystem::create_directory(base+"/rom");std::filesystem::create_directory(base+"/user");
@@ -44,6 +47,38 @@ int main(){
     std::ofstream(base+"/AddOnContent/1/item")<<"owned";
     std::filesystem::create_directory_symlink(base+"/rom",base+"/AddOnContent/2");
     ot2::configure_services(base+"/rom",base+"/user");
+    {uint64_t language=0;call("_ZN2nn8settings15GetLanguageCodeEPNS0_12LanguageCodeE",{address(&language)});
+     require(language==call("_ZN2nn2oe18GetDesiredLanguageEv",{})&&!memcmp(&language,"zh-Hans",7),"System settings language agrees with configured guest language");}
+    {
+        uint64_t cache=99,h=0,read=0;char bytes[5]{};
+        require(call("_ZN2nn2fs29QueryMountSystemDataCacheSizeEPmNS_3ncm12SystemDataIdE",{address(&cache),0x0100000000000823})==0x202,"Missing system archive is not invented");
+        std::filesystem::create_directories(base+"/user/SystemData/0100000000000823");
+        std::ofstream(base+"/user/SystemData/0100000000000823/version.dat")<<"test";
+        require(!call("_ZN2nn2fs29QueryMountSystemDataCacheSizeEPmNS_3ncm12SystemDataIdE",{address(&cache),0x0100000000000823})&&cache==0,"Host directory mounting needs no guest cache allocation");
+        require(!call("_ZN2nn2fs15MountSystemDataEPKcNS_3ncm12SystemDataIdEPvm",{address("ngc"),0x0100000000000823,0,0}),"Mount actual system archive read-only");
+        require(!call("_ZN2nn2fs8OpenFileEPNS0_10FileHandleEPKci",{address(&h),address("ngc:/version.dat"),1}),"Read installed dictionary data");
+        require(!call("_ZN2nn2fs8ReadFileEPmNS0_10FileHandleElPvm",{address(&read),h,0,address(bytes),4})&&read==4&&!strcmp(bytes,"test"),"System archive contents are not synthetic");
+        call("_ZN2nn2fs9CloseFileENS0_10FileHandleE",{h});
+        require(call("_ZN2nn2fs8OpenFileEPNS0_10FileHandleEPKci",{address(&h),address("ngc:/version.dat"),2})!=0,"System archive is never writable");
+        call("_ZN2nn2fs7UnmountEPKc",{address("ngc")});
+        std::filesystem::create_directory_symlink(base+"/rom",base+"/user/SystemData/0100000000000824");
+        require(call("_ZN2nn2fs15MountSystemDataEPKcNS_3ncm12SystemDataIdE",{address("bad"),0x0100000000000824})==0x202,"System data symlink cannot escape archive root");
+    }
+    {
+        int32_t count=99;std::array<uint8_t,32> names;names.fill(0x5a);
+        call("_ZN2nn4bcat10InitializeEv",{});
+        require(call("_ZN2nn4bcat31EnumerateDeliveryCacheDirectoryEPiPNS0_13DirectoryNameEi",{address(&count),address(names.data()),1})==0xa7a&&count==0,"BCAT requires cache mount");
+        require(!call("_ZN2nn4bcat25MountDeliveryCacheStorageEv",{}),"mount empty local BCAT cache");
+        require(!call("_ZN2nn4bcat31EnumerateDeliveryCacheDirectoryEPiPNS0_13DirectoryNameEi",{address(&count),address(names.data()),1})&&count==0&&names.front()==0x5a,"empty BCAT enumeration does not invent entries");
+        require(call("_ZN2nn4bcat17DeliveryCacheFile4OpenERKNS0_13DirectoryNameERKNS0_8FileNameE",{})==0x47a,"BCAT cache miss returns NotFound");
+        uint64_t progress=0;
+        call("_ZN2nn4bcat21DeliveryCacheProgressC1Ev",{address(&progress)});
+        require(call("_ZNK2nn4bcat21DeliveryCacheProgress9GetStatusEv",{address(&progress)})==0,"BCAT progress begins idle");
+        require(call("_ZN2nn4bcat24RequestSyncDeliveryCacheEPNS0_21DeliveryCacheProgressE",{address(&progress)})==0x107a,"offline BCAT sync is denied");
+        require(call("_ZNK2nn4bcat21DeliveryCacheProgress9GetStatusEv",{address(&progress)})==9&&call("_ZNK2nn4bcat21DeliveryCacheProgress9GetResultEv",{address(&progress)})==0x107a,"BCAT terminal progress preserves failure");
+        call("_ZN2nn4bcat21DeliveryCacheProgressD1Ev",{address(&progress)});
+        call("_ZN2nn4bcat27UnmountDeliveryCacheStorageEv",{});
+    }
     require(call("_ZN2nn3aoc17CountAddOnContentEv",{})==2,"only installed canonical DLC directories are reported");
     int32_t indices[4]={-1,-1,-1,-1};
     require(call("_ZN2nn3aoc16ListAddOnContentEPiii",{address(indices),0,4})==2&&indices[0]==1&&indices[1]==3&&indices[2]==-1,"ordered bounded DLC list");
@@ -103,6 +138,16 @@ int main(){
     require(call("_ZN2nn2oe20GetCurrentFocusStateEv",{})==1,"foreground focus");
     require(call("_ZN2nn2oe25TryPopNotificationMessageEPj",{address(&message)})==1&&message==15,"focus notification");
     require(call("_ZN2nn2oe25TryPopNotificationMessageEPj",{address(&message)})==0,"focus notifications coalesce");
+    call("_ZN2nn2oe28SetResumeNotificationEnabledEb",{1});
+    ot2::set_activity_focus(2);ot2::set_activity_focus(1);
+    require(call("_ZN2nn2oe25TryPopNotificationMessageEPj",{address(&message)})==1&&message==15,"Resume retains focus-change notification");
+    require(call("_ZN2nn2oe25TryPopNotificationMessageEPj",{address(&message)})==1&&message==16,"Subscribed guest receives real resume after keyboard focus returns");
+    ot2::set_activity_focus(1);
+    require(call("_ZN2nn2oe25TryPopNotificationMessageEPj",{address(&message)})==0,"Stable foreground does not invent resume events");
+    ot2::set_activity_focus(2);ot2::set_activity_focus(1);
+    call("_ZN2nn2oe28SetResumeNotificationEnabledEb",{0});
+    require(call("_ZN2nn2oe25TryPopNotificationMessageEPj",{address(&message)})==1&&message==15,"Disabling resume does not drop focus state");
+    require(call("_ZN2nn2oe25TryPopNotificationMessageEPj",{address(&message)})==0,"Disabled resume notification is not delivered");
     require(!call("_ZN2nn2fs13MountSaveDataEPKcRKNS_7account3UidE",{address("save"),0}),"mount save");
     require(!call("_ZN2nn2fs10CreateFileEPKcl",{address("save:/slot"),8}),"create save");
     uint64_t handle=0;require(!call("_ZN2nn2fs8OpenFileEPNS0_10FileHandleEPKci",{address(&handle),address("save:/slot"),2}),"open writable save");

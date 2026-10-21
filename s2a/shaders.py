@@ -29,7 +29,7 @@ def prepare(repo, game, work, repak, workers):
     assets = target / 'assets'; assets.mkdir(exist_ok=True)
     paks = sorted((game / 'RomFS').rglob('*.pak'))
     if not paks:
-        raise ValueError('No supported Unreal pak found; this engine needs a shader adapter')
+        return prepare_unity(repo, game, target, output, workers, digest)
     # Preserve subdirectory names. repak fails on encrypted/unsupported archives.
     for pak in paks:
         run([repak, 'unpack', '-q', '-f', '-o', assets, '-i', '**/*.uexp', '-i', '**/*.ushaderbytecode', '-i', '**/GlobalShaderCache*.bin', pak])
@@ -46,5 +46,22 @@ def prepare(repo, game, work, repak, workers):
     run(['dotnet', 'build', repo / 'tools/shader_translate/dmsh_xlate.csproj', '-c', 'Release', '-o', translator])
     run([sys.executable, repo / 'scripts/build-offline-shaders.py', jobs / 'jobs.json', output,
          '--translator', translator / 'dmsh_xlate.dll', '--workers', workers])
+    shader_files(output)
+    return output
+
+
+def prepare_unity(repo, game, target, output, workers, digest):
+    """Unity keeps each platform's NVN programs in compressed sub-program blobs."""
+    raw, jobs = target / 'raw', target / 'jobs'
+    run([sys.executable, repo / 'tools/extract_unity_shaders.py', game / 'RomFS', raw])
+    if not (raw / 'manifest.json').exists():
+        raise ValueError('Unity shader extraction produced no manifest')
+    run([sys.executable, repo / 'tools/prepare_shaders.py', raw, jobs])
+    translator = target / 'translator'
+    if not (translator / 'dmsh_xlate.dll').exists():
+        run(['dotnet', 'build', repo / 'tools/shader_translate/dmsh_xlate.csproj', '-c', 'Release', '-o', translator])
+    run([sys.executable, repo / 'scripts/build-offline-shaders.py', jobs / 'jobs.json', output,
+         '--translator', translator / 'dmsh_xlate.dll', '--workers', workers])
+    run([sys.executable, repo / 'tools/unity_shader_identity.py', raw, output])
     shader_files(output)
     return output

@@ -44,6 +44,24 @@ void* ot2_nvn_lookup(const char* name) {
 }
 #define nvn_lookup ot2_nvn_lookup
 uint64_t nvn_new_serial(void){static _Atomic uint64_t serial;return ++serial;}
+// Debug labels are optional metadata; the Vulkan replay does not consume them.
+// Keep the full object-family entry points available so Unity can label its
+// resources without mistaking a diagnostic API for a missing render feature.
+#define NVN_DEBUG_LABEL(name, type) \
+    NVN(name, void, type *object, const char *label) { (void)object; (void)label; }
+NVN_DEBUG_LABEL(nvnDeviceSetDebugLabel, NVNdevice)
+NVN_DEBUG_LABEL(nvnQueueSetDebugLabel, NVNqueue)
+NVN_DEBUG_LABEL(nvnWindowSetDebugLabel, NVNwindow)
+NVN_DEBUG_LABEL(nvnProgramSetDebugLabel, NVNprogram)
+NVN_DEBUG_LABEL(nvnMemoryPoolSetDebugLabel, NVNmemoryPool)
+NVN_DEBUG_LABEL(nvnTexturePoolSetDebugLabel, NVNtexturePool)
+NVN_DEBUG_LABEL(nvnSamplerPoolSetDebugLabel, NVNsamplerPool)
+NVN_DEBUG_LABEL(nvnBufferSetDebugLabel, NVNbuffer)
+NVN_DEBUG_LABEL(nvnTextureSetDebugLabel, NVNtexture)
+NVN_DEBUG_LABEL(nvnSamplerSetDebugLabel, NVNsampler)
+NVN_DEBUG_LABEL(nvnCommandBufferSetDebugLabel, NVNcommandBuffer)
+NVN_DEBUG_LABEL(nvnSyncSetDebugLabel, NVNsync)
+#undef NVN_DEBUG_LABEL
 NVN(nvnDeviceBuilderSetDefaults, void, NVNdeviceBuilder *b) { memset(b, 0, sizeof(dev_builder_t)); }
 NVN(nvnDeviceBuilderSetFlags, void, NVNdeviceBuilder *b, int f) { ((dev_builder_t *)b)->flags = f; }
 NVN(nvnDeviceInitialize, NVNboolean, NVNdevice *d, const NVNdeviceBuilder *b) {
@@ -125,6 +143,44 @@ NVN(nvnMemoryPoolGetFlags,NVNmemoryPoolFlags,const NVNmemoryPool* p) {return ((c
 NVN(nvnMemoryPoolGetSize,size_t,const NVNmemoryPool* p) {return ((const pool_t*)p)->size;}
 NVN(nvnMemoryPoolMap,void*,const NVNmemoryPool* p) {return ((const pool_t*)p)->mem;}
 NVN(nvnMemoryPoolInvalidateMappedRange,void,const NVNmemoryPool* p,ptrdiff_t offset,size_t size) {(void)p;(void)offset;(void)size;}
+
+// ---------- Buffers backed by a guest memory pool ----------
+NVN(nvnBufferBuilderSetDevice, void, NVNbufferBuilder *b, NVNdevice *d) { ((buf_builder_t *)b)->dev = d; }
+NVN(nvnBufferBuilderSetDefaults, void, NVNbufferBuilder *b) {
+    NVNdevice *d = ((buf_builder_t *)b)->dev;
+    memset(b, 0, sizeof *b);
+    ((buf_builder_t *)b)->dev = d;
+}
+NVN(nvnBufferBuilderSetStorage, void, NVNbufferBuilder *b, NVNmemoryPool *p, ptrdiff_t off, size_t n) {
+    buf_builder_t *o = (buf_builder_t *)b;
+    o->pool = p; o->off = off; o->size = n;
+}
+NVN(nvnBufferInitialize, NVNboolean, NVNbuffer *b, const NVNbufferBuilder *builder) {
+    const buf_builder_t *src = (const buf_builder_t *)builder;
+    const pool_t *pool = (const pool_t *)src->pool;
+    if (!pool || pool->magic != MAGIC('P', 'O', 'O', 'L') || !pool->mem ||
+        src->off < 0 || (uint64_t)src->off > pool->size || src->size > pool->size - (uint64_t)src->off) {
+        LOG("BufferInitialize invalid pool/range pool=%p off=%lld size=%llu", (void *)src->pool,
+            (long long)src->off, (unsigned long long)src->size);
+        return 0;
+    }
+    buf_t *o = (buf_t *)b;
+    *o = (buf_t){MAGIC('B', 'U', 'F', 0), src->pool, src->off, src->size};
+    return 1;
+}
+NVN(nvnBufferFinalize, void, NVNbuffer *b) { ((buf_t *)b)->magic = 0; }
+NVN(nvnBufferMap, void *, const NVNbuffer *b) {
+    const buf_t *o = (const buf_t *)b;
+    return o->magic == MAGIC('B', 'U', 'F', 0) ? ((const pool_t *)o->pool)->mem + o->off : NULL;
+}
+NVN(nvnBufferGetAddress, NVNbufferAddress, const NVNbuffer *b) {
+    return (NVNbufferAddress)(uintptr_t)h_nvnBufferMap(b);
+}
+NVN(nvnBufferGetMemoryPool, NVNmemoryPool *, const NVNbuffer *b) { return ((const buf_t *)b)->pool; }
+NVN(nvnBufferGetMemoryOffset, ptrdiff_t, const NVNbuffer *b) { return ((const buf_t *)b)->off; }
+NVN(nvnBufferGetSize, size_t, const NVNbuffer *b) { return ((const buf_t *)b)->size; }
+NVN(nvnBufferFlushMappedRange, void, const NVNbuffer *b, ptrdiff_t off, size_t n) { (void)b; (void)off; (void)n; }
+NVN(nvnBufferInvalidateMappedRange, void, const NVNbuffer *b, ptrdiff_t off, size_t n) { (void)b; (void)off; (void)n; }
 
 // ---------- 描述符池 ----------
 // ---------- Descriptor pools ----------
@@ -671,6 +727,12 @@ NVN(nvnCommandBufferSetRasterizerDiscard,void,NVNcommandBuffer* c,uint32_t enabl
 NVN(nvnCommandBufferSetDepthClamp,void,NVNcommandBuffer* c,uint32_t enable){*(uint32_t*)rec(c,OP_DEPTH_CLAMP,8)=B(enable)!=0;}
 NVN(nvnCommandBufferSetRenderEnable,void,NVNcommandBuffer* c,uint32_t enable){*(uint32_t*)rec(c,OP_RENDER_ENABLE,8)=B(enable)!=0;}
 NVN(nvnCommandBufferSetLineWidth,void,NVNcommandBuffer* c,float width){*(float*)rec(c,OP_LINE_WIDTH,8)=width;}
+// Vulkan's fixed one-pixel point size matches NVN's default. A larger point
+// would require shader-side gl_PointSize support; fail explicitly until then.
+NVN(nvnCommandBufferSetPointSize,void,NVNcommandBuffer* c,float size){
+    (void)c;
+    if (size != 1.0f) { LOG("Unsupported NVN point size %g", size); die("Non-default point size requires shader support"); }
+}
 NVN(nvnCommandBufferDownsampleTextureView,void,NVNcommandBuffer* c,const NVNtexture* source,const NVNtextureView* sv,const NVNtexture* destination,const NVNtextureView* dv){
     const tex_t* s=CTX(source);const tex_t* d=CTX(destination);const view_t* a=(const view_t*)sv;const view_t* b=(const view_t*)dv;
     unsigned sl=a&&a->set_levels?a->base_level:0,dl=b&&b->set_levels?b->base_level:0;
@@ -678,6 +740,11 @@ NVN(nvnCommandBufferDownsampleTextureView,void,NVNcommandBuffer* c,const NVNtext
     int sw=s->d.width>>sl,sh=s->d.height>>sl,dw=d->d.width>>dl,dh=d->d.height>>dl;
     NVNcopyRegion sr={0,0,0,sw?sw:1,sh?sh:1,layers},dr={0,0,0,dw?dw:1,dh?dh:1,layers};
     h_nvnCommandBufferCopyTextureToTexture(c,source,sv,&sr,destination,dv,&dr,0);
+}
+NVN(nvnCommandBufferDownsample,void,NVNcommandBuffer* c,const NVNtexture* source,const NVNtexture* destination){
+    // Whole-texture form of the same multisample resolve operation. The
+    // backend validates dimensions/format and records a real Vulkan resolve.
+    h_nvnCommandBufferDownsampleTextureView(c,source,NULL,destination,NULL);
 }
 NVN(nvnCommandBufferSetBlendColor, void, NVNcommandBuffer *c, const float *v) { memcpy(REC(c, OP_BLEND_COLOR, p_blend_color)->rgba, v, 16); }
 
@@ -695,6 +762,7 @@ NVN(nvnColorStateSetBlendEnable, void, NVNcolorState *s, int i, uint32_t en) {
     color_st *o = ST(color_st, s); if (i < 0 || i > 7) return;
     o->blend_en = B(en) ? (o->blend_en | 1u << i) : (o->blend_en & ~(1u << i));
 }
+NVN(nvnColorStateSetLogicOp, void, NVNcolorState *s, NVNlogicOp op) { ST(color_st, s)->logic_op = op; }
 NVN(nvnChannelMaskStateSetDefaults, void, NVNchannelMaskState *s) { ST(chmask_st, s)->mask = 0xffffffffu; }
 NVN(nvnChannelMaskStateSetChannelMask, void, NVNchannelMaskState *s, int i, uint32_t r, uint32_t g, uint32_t b, uint32_t a) {
     if (i < 0 || i > 7) return;
@@ -703,8 +771,13 @@ NVN(nvnChannelMaskStateSetChannelMask, void, NVNchannelMaskState *s, int i, uint
 }
 NVN(nvnMultisampleStateSetDefaults, void, NVNmultisampleState *s) { memset(s, 0, sizeof(ms_st)); ST(ms_st, s)->enable = 1; }
 NVN(nvnMultisampleStateSetMultisampleEnable, void, NVNmultisampleState *s, uint32_t e) { ST(ms_st, s)->enable = B(e) != 0; }
+NVN(nvnMultisampleStateGetMultisampleEnable, NVNboolean, const NVNmultisampleState *s) { return ((const ms_st *)s)->enable != 0; }
 NVN(nvnMultisampleStateSetSamples, void, NVNmultisampleState *s, int n) { ST(ms_st, s)->samples = (uint8_t)n; }
+NVN(nvnMultisampleStateGetSamples, int, const NVNmultisampleState *s) { return ((const ms_st *)s)->samples; }
 NVN(nvnMultisampleStateSetAlphaToCoverageEnable, void, NVNmultisampleState *s, uint32_t e) { ST(ms_st, s)->a2c = B(e) != 0; }
+NVN(nvnMultisampleStateGetAlphaToCoverageEnable, NVNboolean, const NVNmultisampleState *s) { return ((const ms_st *)s)->a2c != 0; }
+NVN(nvnMultisampleStateSetAlphaToCoverageDither, void, NVNmultisampleState *s, uint32_t e) { ST(ms_st, s)->a2c_dither = B(e) != 0; }
+NVN(nvnMultisampleStateGetAlphaToCoverageDither, NVNboolean, const NVNmultisampleState *s) { return ((const ms_st *)s)->a2c_dither != 0; }
 NVN(nvnMultisampleStateSetSampleLocationsEnable, void, NVNmultisampleState *s, uint32_t e) { ST(ms_st, s)->sl_en = B(e) != 0; }
 NVN(nvnMultisampleStateSetSampleLocations, void, NVNmultisampleState *s, int start, int n, const float *v) { (void)s; (void)start; (void)n; (void)v; }
 NVN(nvnPolygonStateSetDefaults, void, NVNpolygonState *s) { *ST(poly_st, s) = (poly_st){NVN_FACE_NONE, NVN_FRONT_FACE_CCW, NVN_POLYGON_MODE_FILL, 0}; }
@@ -747,9 +820,12 @@ NVN(nvnWindowBuilderSetTextures, void, NVNwindowBuilder *b, int n, NVNtexture *c
     WB(b)->ntex = n; for (int i = 0; i < n; i++) WB(b)->tex[i] = t[i];
 }
 NVN(nvnWindowBuilderSetPresentInterval, void, NVNwindowBuilder *b, int v) { WB(b)->interval = v; }
+NVN(nvnWindowBuilderSetNumActiveTextures, void, NVNwindowBuilder *b, int n) { WB(b)->active_ntex = n; }
 NVN(nvnWindowInitialize, NVNboolean, NVNwindow *w, const NVNwindowBuilder *b) {
     const win_builder_t *s = (const win_builder_t *)b; win_t *o = (win_t *)w;
-    memset(o, 0, sizeof *o); o->magic = MAGIC('W', 'I', 'N', 'D'); o->native = s->native; o->ntex = s->ntex; o->interval = s->interval;
+    memset(o, 0, sizeof *o); o->magic = MAGIC('W', 'I', 'N', 'D'); o->native = s->native;
+    o->ntex = s->active_ntex > 0 && s->active_ntex <= s->ntex ? s->active_ntex : s->ntex;
+    o->interval = s->interval;
     memcpy(o->tex, s->tex, sizeof o->tex);
     LOG("[nvn] WindowInitialize 交换链 %d 张 间隔 %d 首张 %dx%d 格式 %#x", o->ntex, o->interval,
         o->ntex ? (int)CTX(o->tex[0])->d.width : 0, o->ntex ? (int)CTX(o->tex[0])->d.height : 0, o->ntex ? CTX(o->tex[0])->d.format : 0);

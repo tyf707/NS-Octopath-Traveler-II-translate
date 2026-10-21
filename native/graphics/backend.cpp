@@ -4,6 +4,8 @@
 #include "nvn_program.h"
 #include "shader_reflection.h"
 #include "shader_compat.h"
+#include "unity_shader_identity.h"
+#include "quad_indices.h"
 #include "../third_party/spirv/spirv.hpp"
 #include "bc_texture.h"
 #include "copy_layout.h"
@@ -116,6 +118,7 @@ uintptr_t descriptor_pool_key(const dpool_t* p){if(!p || !p->pool || !p->pool->m
 std::mutex state_mutex;std::condition_variable surface_changed;
 std::string shader_directory;
 std::string shader_binary_directory;
+std::map<std::string,std::string> shader_control_aliases;
 VkShaderModule shared_shader_module(const uint32_t*,size_t);
 void start_pipeline_warmup();
 bool complete_shader_cache=false;
@@ -237,6 +240,15 @@ float timestamp_period=1;
 std::string shader_key(const void* control) {
     uint64_t hash=14695981039346656037ULL;auto* p=static_cast<const uint8_t*>(control);for(unsigned j=0;j<0x880;j++)hash=(hash^p[j])*1099511628211ULL;
     char key[32];snprintf(key,sizeof(key),"%016llx",(unsigned long long)hash);return key;
+}
+std::string shader_cache_key(const NVNshaderData& sd,const std::string& raw_key) {
+    if(shader_control_aliases.empty())return raw_key;
+    uint32_t size=0;memcpy(&size,static_cast<const uint8_t*>(sd.control)+0x704,4);
+    if(size<8 || size>8*1024*1024)ot2_host_die("Invalid aliased shader code size");
+    auto hash=unity_shader_identity(sd.control,reinterpret_cast<const void*>(sd.data),size);
+    char alias[17];snprintf(alias,sizeof(alias),"%016llx",(unsigned long long)hash);
+    auto found=shader_control_aliases.find(alias);
+    return found==shader_control_aliases.end()?raw_key:found->second;
 }
 uint64_t monotonic_ns(){timespec t{};clock_gettime(CLOCK_MONOTONIC,&t);return uint64_t(t.tv_sec)*1000000000+t.tv_nsec;}
 struct Perf {uint64_t passes{},submits{},wait_ns{},draw_ns{},buffer_ns{},buffer_bytes{},vertex_bytes{},uniform_bytes{},storage_bytes{},buffer_allocs{},pipeline_ns{},replay_ns{},replay_cpu_ns{};} perf;
@@ -822,12 +834,28 @@ extern "C" void vkhost_configure_package(const char* path,const char* offline) {
         if(manifest.value("format",0)!=1 || manifest.value("id",std::string())!=id || manifest["shaders"].empty())ot2_host_die("Invalid offline shader cache manifest");
         complete_shader_cache=true;ot2_host_log("OFFLINE_SHADERS id=%s shaders=%zu",id.c_str(),manifest["shaders"].size());
     }
-    if(offline){
+    // An explicitly selected, immutable development set takes precedence over
+    // the packaged fallback. Both are pinned for the lifetime of the process.
+    if(offline && !complete_shader_cache){
         shader_binary_directory=offline;
         std::ifstream file(shader_binary_directory+"/manifest.json");nlohmann::json manifest;
         if(!file)ot2_host_die("Package shader manifest missing");file>>manifest;
         if(manifest.value("format",0)!=1||manifest["shaders"].empty())ot2_host_die("Invalid package shader manifest");
         complete_shader_cache=true;
+    }
+    shader_control_aliases.clear();
+    if(complete_shader_cache){
+        std::ifstream file(shader_binary_directory+"/manifest.json");Json manifest;file>>manifest;
+        if(manifest.contains("control_aliases")){
+            const auto& aliases=manifest.at("control_aliases");
+            if(aliases.at("algorithm")!="unity-nvn-control-code-v1")ot2_host_die("Unknown shader alias algorithm");
+            for(auto it=aliases.at("keys").begin();it!=aliases.at("keys").end();++it){
+                auto target=it.value().get<std::string>();
+                if(it.key().size()!=16 || it.key().find_first_not_of("0123456789abcdef")!=std::string::npos || !manifest.at("shaders").contains(target))ot2_host_die("Invalid shader control alias");
+                shader_control_aliases.emplace(it.key(),std::move(target));
+            }
+            ot2_host_log("UNITY_SHADER_ALIASES count=%zu",shader_control_aliases.size());
+        }
     }
     readonly_stores_enabled=false;
     trace_draw_completion=std::filesystem::exists(shader_directory+"/trace-draw-completion");
@@ -845,7 +873,12 @@ extern "C" void vkhost_program(const prog_t* program) {
         uint64_t hash=14695981039346656037ULL;for(unsigned j=0;j<0x880;j++)hash=(hash^control[j])*1099511628211ULL;
         char key[32];snprintf(key,sizeof(key),"%016llx",(unsigned long long)hash);
         const auto base=shader_directory+"/"+key;
-        if(!complete_shader_cache&&!std::filesystem::exists(base+".control")) {
+        // Preserve missing programs for diagnosis even with a packaged cache.
+        // The draw path still rejects absent translations; this capture lets
+        // the offline compiler recover the exact runtime control/code pair.
+        const auto translated=shader_binary_directory+"/"+shader_cache_key(program->sd[stage],key);
+        const bool missing_translation=!std::filesystem::exists(translated+".spv") || !std::filesystem::exists(translated+".res.json");
+        if((!complete_shader_cache || missing_translation)&&!std::filesystem::exists(base+".control")) {
             std::ofstream(base+".control",std::ios::binary).write(reinterpret_cast<const char*>(control),0x880);
             std::ofstream(base+".code",std::ios::binary).write(reinterpret_cast<const char*>(code),size);
             ot2_host_log("SHADER %s size=%x code_magic=%x",key,size,code_magic);
@@ -1362,12 +1395,42 @@ extern "C" void vkhost_submit(int n,const uint64_t* handles) {
 }
 extern "C" uint64_t vkhost_frame_count() {return presented_frames.load();}
 extern "C" void vkhost_frame_stats(double out[4]){std::lock_guard lock(frame_stats_mutex);auto s=frame_stats.sample(monotonic_ns());out[0]=s.fps;out[1]=s.mean_ms;out[2]=s.p95_ms;out[3]=s.source;}
+// 出图间隔覆盖：游戏请求 interval=2（30Hz）；debug.ot2.interval=1 可强制 60Hz 节奏做实验。
+static std::atomic<int> present_interval_runtime{-2}; // -2=未覆盖；-1=跟随游戏；0..5=强制
+extern "C" void vkhost_set_present_interval(int value) {present_interval_runtime.store(value,std::memory_order_relaxed);}
+static int present_interval_override() {
+#ifdef __ANDROID__
+    const int overridden = present_interval_runtime.load(std::memory_order_relaxed);
+    if (overridden != -2) return overridden;
+    static std::atomic<int> cached{-2};
+    int value = cached.load(std::memory_order_relaxed);
+    if (value == -2) {
+        // 默认 1 = 不按游戏请求的 2（30Hz）节流，最多到 60Hz。
+        // 实测游戏移动是按时间的（30/44fps 下每个长按位移一致），高帧率不会加速游戏；
+        // 而场景加载是按帧推进的，所以高帧率还能缩短过场。
+        // debug.ot2.interval=-1 恢复跟随游戏（30Hz），0..5 可强制指定。
+        value = 1;
+        char property[PROP_VALUE_MAX]{};
+        if (__system_property_get("debug.ot2.interval", property) > 0) {
+            char* end = nullptr;
+            const long parsed = strtol(property, &end, 10);
+            if (end && *end == 0 && parsed >= -1 && parsed <= 5) value = int(parsed);
+        }
+        cached.store(value, std::memory_order_relaxed);
+    }
+    return value;
+#else
+    return -1;
+#endif
+}
 static void present_frame(const tex_t* texture,int interval,const int* crop,uint64_t dependency) {
     FrameTraceScope trace("OT2 present frame");
     const auto work_end=monotonic_ns();
-    {std::lock_guard lock(state_mutex);performance_hint_frame(dependency,interval,work_end,window&&!presentation_suspended);}
+    const int override_interval=present_interval_override();
+    const int pace_interval=override_interval>=0?override_interval:interval;
+    {std::lock_guard lock(state_mutex);performance_hint_frame(dependency,pace_interval,work_end,window&&!presentation_suspended);}
     static nvn_pacer pacer{};
-    const auto period=uint64_t(std::clamp(interval,0,5))*16666667;
+    const auto period=uint64_t(std::clamp(pace_interval,0,5))*16666667;
     nvn_pace(&pacer,monotonic_ns(),period);
     const auto deadline=pacer.target;
     auto wait_for_slot=[&]{
@@ -1571,7 +1634,7 @@ static void present_frame(const tex_t* texture,int interval,const int* crop,uint
         stats_log("ATTACHMENT_STORES enabled=%u color_none=%llu depth_none=%llu stencil_none=%llu promotions=%llu fallbacks=%llu",readonly_stores_enabled,(unsigned long long)attachment_stores.none[0],(unsigned long long)attachment_stores.none[1],(unsigned long long)attachment_stores.none[2],(unsigned long long)attachment_stores.promotions,(unsigned long long)attachment_stores.fallbacks);
         attachment_stores={};readonly_stores_enabled=std::filesystem::exists(shader_directory+"/readonly-stores")&&!std::filesystem::exists(shader_directory+"/no-readonly-stores");
     }
-    if(frame%60==0){static uint64_t previous_ns=0;timespec ts{};clock_gettime(CLOCK_MONOTONIC,&ts);uint64_t now=uint64_t(ts.tv_sec)*1000000000+ts.tv_nsec;if(previous_ns)ot2_host_log("PRESENT_RATE frames=60 seconds=%.3f fps=%.2f",double(now-previous_ns)/1e9,60e9/double(now-previous_ns));previous_ns=now;}
+    if(frame%60==0){static uint64_t previous_ns=0;::timespec ts{};::clock_gettime(CLOCK_MONOTONIC,&ts);uint64_t now=uint64_t(ts.tv_sec)*1000000000+ts.tv_nsec;if(previous_ns)ot2_host_log("PRESENT_RATE frames=60 seconds=%.3f fps=%.2f",double(now-previous_ns)/1e9,60e9/double(now-previous_ns));previous_ns=now;}
     if(frame%60==0&&geometry_query_workaround)stats_log("SOFTWARE_SAMPLES draws=%llu",(unsigned long long)software_sample_draws);
     if(frame%60==0){stats_log("PIPELINE_CACHE foreground=%llu warm=%llu claimed=%llu rejected=%llu running=%u",(unsigned long long)foreground_created.load(),(unsigned long long)warm_created.load(),(unsigned long long)warm_claimed.load(),(unsigned long long)warm_rejected.load(),warm_running.load());asynchronous_gpu=!std::filesystem::exists(shader_directory+"/synchronous-gpu");stats_log("GPU_RING enabled=%u peak=%llu slots=%zu reuses=%llu",asynchronous_gpu,(unsigned long long)gpu_inflight_peak,gpu_ring_size,(unsigned long long)gpu_ring_reuses);batch_query_resets=!std::filesystem::exists(shader_directory+"/synchronous-queries");buffer_mirrors_enabled=!std::filesystem::exists(shader_directory+"/no-buffer-mirrors");reuse_bindings=!std::filesystem::exists(shader_directory+"/uncached-bindings");gpu_deswizzle_enabled=!std::filesystem::exists(shader_directory+"/cpu-deswizzle");stats_log("BUFFER_MIRRORS enabled=%u reuses=%llu writebacks=%llu",buffer_mirrors_enabled,(unsigned long long)mirror_reuses,(unsigned long long)mirror_writebacks);batch_enabled=!std::filesystem::exists(shader_directory+"/synchronous");merge_enabled=!std::filesystem::exists(shader_directory+"/separate-passes");reuse_descriptors=!std::filesystem::exists(shader_directory+"/uncached-descriptors");stats_log("FRAME_COST frames=60 passes=%llu submits=%llu wait_ms=%.3f draw_ms=%.3f buffer_ms=%.3f upload_mb=%.3f vertex_mb=%.3f uniform_mb=%.3f storage_mb=%.3f allocs=%llu pipeline_ms=%.3f replay_ms=%.3f",(unsigned long long)perf.passes,(unsigned long long)perf.submits,perf.wait_ns/60e6,perf.draw_ns/60e6,perf.buffer_ns/60e6,perf.buffer_bytes/(60.0*1048576),perf.vertex_bytes/(60.0*1048576),perf.uniform_bytes/(60.0*1048576),perf.storage_bytes/(60.0*1048576),(unsigned long long)perf.buffer_allocs,perf.pipeline_ns/60e6,perf.replay_ns/60e6);report_descriptors();perf={};}
     if(source.drawn && (frame<=10 || frame%60==0))(frame<=10?ot2_host_log:stats_log)("GAME_FRAME_PRESENTED frame=%llu draw=%llu",(unsigned long long)frame,(unsigned long long)source.drawn);

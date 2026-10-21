@@ -28,6 +28,8 @@ public:
     explicit LoadedGame(const std::string& directory);
     ~LoadedGame();
     uintptr_t symbol(const std::string& name) const;
+    // 导出符号清单（按前缀过滤），用于启动自检“这个游戏用到哪些 SDK 符号”。
+    std::vector<std::string> exported_names(const std::string& prefix) const;
     std::vector<ModuleView> modules() const;
     std::vector<uintptr_t> initializers() const;
     void make_executable();

@@ -134,6 +134,19 @@ adb devices
 
 打包工具位于 `s2a/`，Android 应用位于 `app/`，原生运行时和 Vulkan 后端位于 `native/`，离线着色器工具位于 `tools/`。
 
+### 着色器适配器
+
+为 Horizon 编译的着色器会在构建时从零售数据中提取，并预先翻译为 SPIR-V。使用哪个适配器由配置的 `resource_adapter` 决定：
+
+| 引擎 | NVN 二进制的来源 | 适配器 |
+|---|---|---|
+| 虚幻引擎 | `RomFS/**/*.pak` 加 `GlobalShaderCache-SF_GLSL_SWITCH.bin` | `tools/extract_shaders.py` |
+| Unity | UnityFS 包内的 `Shader.compressedBlob` | `tools/extract_unity_shaders.py` |
+
+Unity 把各平台编译好的程序存放在压缩的子程序块里。在 Switch 上这些程序就是 NVN 着色器二进制，封装格式为 `[u32 control_size][u32 code_size][control][code]`，即长度在前、控制块紧随其后；而虚幻的封装是代码在前。提取器会遍历包、解压对应平台的数据、切出每一个格式正确的二进制，并写出 `{key}.control/.code/.asm` 供离线翻译器使用。与虚幻数据一致，key 是控制块的 FNV-1a 哈希，因此能和运行时绘制时算出的 key 对上。Unity 的控制块理论上也带汇编文本，但零售版本会把它剥掉；`.asm` 为空意味着无法推断纹理与图像槽位表，翻译器会以空绑定运行。
+
+`resource_adapter` 为 `generic` 的配置不使用任何适配器，这是着色器无法用上述方式恢复的引擎的正确设置。
+
 运行以下检查不需要游戏文件：
 
 ```sh

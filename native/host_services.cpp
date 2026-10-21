@@ -26,6 +26,7 @@
 #include <fstream>
 #include <memory>
 #include <atomic>
+#include <cstdio>
 
 namespace ot2 {
 namespace {
@@ -34,10 +35,12 @@ template<class T> T* ptr(uint64_t p) { return reinterpret_cast<T*>(p); }
 const char* str(uint64_t p) { return ptr<const char>(p); }
 uint64_t ok(Registers) { return 0; }
 uint64_t yes(Registers) { return 1; }
+uint64_t desired_language(Registers){uint64_t code=0;memcpy(&code,"zh-Hans",7);return code;}
 std::string romfs,user;
 std::map<int,std::string> addon_content;
 uint64_t program_id=legacy_ot2_program_id;
 std::mutex activity_mutex;bool activity_active=true,focus_notification=false;unsigned activity_focus=1;
+bool resume_notification_enabled=false,resume_notification=false;
 std::chrono::steady_clock::time_point active_since=std::chrono::steady_clock::now();
 uint64_t active_ns=0;
 uint64_t active_time(){std::lock_guard lock(activity_mutex);return active_ns+(activity_active?std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now()-active_since).count():0);}
@@ -108,6 +111,24 @@ uint64_t mount(const char* name,const std::string& directory,bool read_only,bool
     mounts[name]={target,read_only,save,save_read_only};ot2_host_log("MOUNT %s: -> %s readonly=%d",name,target.c_str(),read_only);return 0;
 }
 int fd(uint64_t handle) {auto it=files.find(handle);return it==files.end()?-1:it->second.descriptor;}
+std::string system_data(uint64_t id){
+    char name[17];snprintf(name,sizeof(name),"%016llx",(unsigned long long)id);
+    const auto root=std::filesystem::path(user)/"SystemData",archive=root/name;
+    std::error_code ec;
+    if(!std::filesystem::is_directory(std::filesystem::symlink_status(root,ec)) ||
+       !std::filesystem::is_directory(std::filesystem::symlink_status(archive,ec)))return {};
+    // Installed archives are extracted data only, never host filesystem links.
+    for(std::filesystem::recursive_directory_iterator it(archive,ec),end;!ec&&it!=end;it.increment(ec)){
+        auto st=it->symlink_status(ec);
+        if(ec || (!std::filesystem::is_directory(st)&&!std::filesystem::is_regular_file(st)))return {};
+    }
+    return ec?std::string{}:archive.string();
+}
+uint64_t mount_system_data(Registers r){
+    auto archive=system_data(r[1]);
+    if(archive.empty())return PathNotFound;
+    return mount(str(r[0]),archive,true);
+}
 uint64_t open_file(Registers r) {
     std::lock_guard lock(filesystem_mutex);auto p=path(str(r[1]),r[2]&2);
     if(p.empty())return PermissionDenied;
@@ -214,6 +235,92 @@ uint64_t open_cache_list(Registers r) {
     }
     if(ec)return IoError;std::sort(snapshot.indices.begin(),snapshot.indices.end());auto h=next_handle++;cache_lists.emplace(h,std::move(snapshot));*ptr<uint64_t>(r[0])=h;return 0;
 }
+// Horizon ABI (libnx time.h): offset + SteadyClockTimePoint{seconds, UUID}.
+// Unity requires a successful, stable context before it enables its FILETIME
+// clock. A missing context made DateTime.Now clamp to year 1 even though our
+// separate GetCurrentTime adapter returned the correct POSIX time.
+struct UserClockContext { int64_t offset,steady_seconds; std::array<uint64_t,2> source; };
+static_assert(sizeof(UserClockContext)==0x20 && offsetof(UserClockContext,source)==0x10);
+uint64_t user_clock_context(Registers r) {
+    if(!r[0])return 116+(901<<9);
+    using namespace std::chrono;
+    const int64_t wall_ns=duration_cast<nanoseconds>(system_clock::now().time_since_epoch()).count();
+    const int64_t steady_ns=duration_cast<nanoseconds>(steady_clock::now().time_since_epoch()).count();
+    struct State {std::mutex mutex;bool initialized=false;int64_t wall_to_steady_ns=0;UserClockContext context{};};
+    static State state;
+    std::lock_guard lock(state.mutex);
+    const int64_t delta=wall_ns-steady_ns;
+    // Keep ordinary reads byte-identical, but expose genuine host clock changes
+    // through a new offset. The source identifies this runtime clock domain.
+    if(!state.initialized || delta-state.wall_to_steady_ns>1000000000LL || state.wall_to_steady_ns-delta>1000000000LL) {
+        if(!state.initialized) state.context.source={uint64_t(steady_ns),uint64_t(wall_ns)^uint64_t(getpid())};
+        state.context.steady_seconds=steady_ns/1000000000LL;
+        state.context.offset=wall_ns/1000000000LL-state.context.steady_seconds;
+        state.wall_to_steady_ns=delta;
+        state.initialized=true;
+        ot2_host_log("USER_CLOCK_CONTEXT posix=%lld steady=%lld",(long long)(state.context.offset+state.context.steady_seconds),(long long)state.context.steady_seconds);
+    }
+    memcpy(ptr<void>(r[0]),&state.context,sizeof(state.context));
+    return 0;
+}
+
+/* nn::time::ClockSnapshot::CreateWithStandardSystemClock 与
+ * CalculateStandardUserSystemClockDifferenceByUser 在 SDK 内部要走 timesrv 服务，
+ * 宿主没有 timesrv，服务调用失败后 SDK 直接 abort（svcBreak），把场景加载打断。
+ * 这里用宿主时钟填一个自洽的 0xD0 快照：0x40 存 POSIX 秒（两个函数之间的约定），
+ * 0x50/0x58 是 user/network CalendarTime，0x68/0xA8 是 LocationName。
+ * 游戏侧只用 GetSnapshot/Compare 两个入口，不与快照字节布局耦合。 */
+extern "C" uint64_t ot2_host_clock_snapshot(uint64_t* registers) {
+    auto* s = reinterpret_cast<uint8_t*>(registers[0]);
+    if (!s) return 0;
+    memset(s, 0, 0xD0);
+    const int64_t now = int64_t(time(nullptr));
+    memcpy(s + 0x40, &now, 8);
+    struct tm tmv{};
+    const time_t t = time_t(now);
+    gmtime_r(&t, &tmv);
+    const auto calendar = [](uint8_t* p, const struct tm& v) {
+        const uint16_t year = uint16_t(v.tm_year + 1900);
+        memcpy(p, &year, 2);
+        p[2] = uint8_t(v.tm_mon + 1); p[3] = uint8_t(v.tm_mday);
+        p[4] = uint8_t(v.tm_hour); p[5] = uint8_t(v.tm_min); p[6] = uint8_t(v.tm_sec); p[7] = 0;
+    };
+    calendar(s + 0x50, tmv);
+    calendar(s + 0x58, tmv);
+    memcpy(s + 0x68, "UTC", 4);
+    memcpy(s + 0xA8, "UTC", 4);
+    ot2_host_log("CLOCK_SNAPSHOT posix=%lld", (long long)now);
+    return 0;
+}
+
+extern "C" uint64_t ot2_host_clock_diff(uint64_t* registers) {
+    const auto* a = reinterpret_cast<const uint8_t*>(registers[0]);
+    const auto* b = reinterpret_cast<const uint8_t*>(registers[1]);
+    int64_t ta = 0, tb = 0;
+    if (a) memcpy(&ta, a + 0x40, 8);
+    if (b) memcpy(&tb, b + 0x40, 8);
+    const int64_t diff = (tb - ta) * 1000000000LL;
+    ot2_host_log("CLOCK_DIFF a=%lld b=%lld diff_ns=%lld", (long long)ta, (long long)tb, (long long)diff);
+    return uint64_t(diff);
+}
+
+/* 本场景没有初始化 GameManager.nowTime（GameManager.Initialize/OnUpdate 都没跑），
+ * 游戏自己的 SystemTimeWork.SetTime 会对默认 DateTime 调 ToFileTime 抛异常，
+ * 把命名回调整个展开掉。这里用宿主时钟做同语义实现：
+ * GMTIME{ uint saveCount; int64 timestmp; }，timestmp = FILETIME(now)。
+ * 这是补宿主时钟，不是伪造剧情状态。 */
+extern "C" uint64_t ot2_host_set_start_time(uint64_t* registers) {
+    auto* g = reinterpret_cast<uint8_t*>(registers[0]);
+    if (!g) return 0;
+    const int64_t now = int64_t(time(nullptr));
+    const int64_t filetime = (now + 11644473600LL) * 10000000LL;
+    memcpy(g + 4, &filetime, 8);
+    uint32_t count = 0;
+    memcpy(&count, g, 4);
+    if (count <= 0x3B9AC9FEu) { count++; memcpy(g, &count, 4); }
+    ot2_host_log("SET_START_TIME now=%lld filetime=%lld count=%u", (long long)now, (long long)filetime, count);
+    return 0;
+}
 uint64_t calendar_time(Registers r) {
     if(!r[2])return 116+(901<<9);
     return time_zone_convert(ptr<CalendarTime>(r[0]),ptr<CalendarAdditionalInfo>(r[1]),*ptr<int64_t>(r[2]),ptr<void>(r[3]));
@@ -244,6 +351,21 @@ uint64_t display_event(Registers r) {
 }
 uint64_t open_user(Registers r) {auto* out=ptr<uint64_t>(r[0]);out[0]=uid[0];out[1]=uid[1];out[2]=0x4f543255534552ULL;return 1;}
 uint64_t unavailable(Registers){return 0x2a2;}
+// BCAT's offline cache is empty. Result ABI: module 122, descriptions from
+// Ryujinx.Horizon/Bcat/BcatResult.cs (NotFound=2, NotOpen=7,
+// InternetRequestDenied=8). No remote synchronization is reported as success.
+constexpr uint32_t BcatInvalidArgument=122+(1<<9),BcatNotFound=122+(2<<9),
+    BcatNotMounted=122+(5<<9),BcatNotOpen=122+(7<<9),BcatOffline=122+(8<<9);
+std::mutex bcat_mutex;
+bool bcat_mounted=false;
+struct BcatProgress {uint32_t status=0,result=BcatOffline;};
+std::map<uint64_t,BcatProgress> bcat_progress;
+uint64_t bcat_empty_entries(Registers r){
+    std::lock_guard lock(bcat_mutex);
+    if(!r[0] || static_cast<int32_t>(r[2])<0 || (r[2]&&!r[1]))return BcatInvalidArgument;
+    *ptr<int32_t>(r[0])=0;
+    return bcat_mounted?0:BcatNotMounted;
+}
 thread_local int socket_error=50; // Horizon/FreeBSD ENETDOWN, not Android errno.
 uint64_t socket_failure(Registers){socket_error=50;return uint64_t(-1);}
 uint64_t completed_account_event(Registers r){
@@ -276,7 +398,7 @@ void set_activity_focus(unsigned state){
     if(state<1 || state>3)ot2_host_die("Invalid activity focus state %u",state);
     {std::lock_guard lock(activity_mutex);auto now=std::chrono::steady_clock::now();
         if(activity_active)active_ns+=std::chrono::duration_cast<std::chrono::nanoseconds>(now-active_since).count();
-        active_since=now;if(activity_focus!=state){focus_notification=true;ot2_host_log("ACTIVITY_FOCUS state=%u",state);}activity_focus=state;activity_active=state==1;}
+        active_since=now;if(activity_focus!=state){focus_notification=true;if(state==1&&resume_notification_enabled)resume_notification=true;ot2_host_log("ACTIVITY_FOCUS state=%u",state);}activity_focus=state;activity_active=state==1;}
     set_audio_active(state==1);
 }
 void set_activity_active(bool active){set_activity_focus(active?1:2);}
@@ -368,16 +490,16 @@ const std::vector<HostService>& host_services() {
         {"nnsocketSetLastErrno",[](Registers r)->uint64_t{socket_error=int32_t(r[0]);return 0;}},
         {"nnsocketSetSockOpt",socket_failure},
         {"nnsocketSocket",socket_failure},
-        {"_ZN2nn3ngc15ProfanityFilter10InitializeEPvmb",ok},
-        {"_ZN2nn3ngc15ProfanityFilter11SetMaskModeENS1_8MaskModeE",ok},
-        {"_ZN2nn3ngc15ProfanityFilter24MaskProfanityWordsInTextEPiPtj",[](Registers r)->uint64_t{if(r[1])*ptr<int32_t>(r[1])=0;return 0;}},
-        {"_ZN2nn3ngc15ProfanityFilterC1Ev",ok},
-        {"_ZN2nn3ngc15ProfanityFilterD1Ev",ok},
+        // NGC lifecycle and checks run in the original SDK against real,
+        // separately installed system-data dictionaries (MountSystemData).
         {"_ZN2nn4time10InitializeEv",ok},
+        {"_ZN2nn4time13ClockSnapshot29CreateWithStandardSystemClockEPS1_",ot2_host_clock_snapshot},
+        {"_ZN2nn4time48CalculateStandardUserSystemClockDifferenceByUserERKNS0_13ClockSnapshotES3_",ot2_host_clock_diff},
         {"_ZN2nn4time13IsInitializedEv",yes},
-        {"_ZN2nn4time23StandardUserSystemClock14GetCurrentTimeEPNS0_9PosixTimeE",[](Registers r)->uint64_t{*ptr<int64_t>(r[0])=time(nullptr);return 0;}},
-        {"_ZN2nn4time21GetDeviceLocationNameEPNS0_12LocationNameE",[](Registers r)->uint64_t{return time_zone_location(ptr<void>(r[0]));}},
-        {"_ZN2nn4time16LoadTimeZoneRuleEPNS0_12TimeZoneRuleERKNS0_12LocationNameE",[](Registers r)->uint64_t{return time_zone_load(ptr<void>(r[0]),str(r[1]));}},
+        {"_ZN2nn4time23StandardUserSystemClock14GetCurrentTimeEPNS0_9PosixTimeE",[](Registers r)->uint64_t{const auto now=time(nullptr);*ptr<int64_t>(r[0])=now;ot2_host_log("TIME_NOW now=%lld",(long long)now);return 0;}},
+        {"_ZN2nn4time23StandardUserSystemClock21GetSystemClockContextEPNS0_18SystemClockContextE",user_clock_context},
+        {"_ZN2nn4time21GetDeviceLocationNameEPNS0_12LocationNameE",[](Registers r)->uint64_t{const auto rc=time_zone_location(ptr<void>(r[0]));ot2_host_log("TIME_LOC rc=%u name=%s",rc,r[0]?str(r[0]):"");return rc;}},
+        {"_ZN2nn4time16LoadTimeZoneRuleEPNS0_12TimeZoneRuleERKNS0_12LocationNameE",[](Registers r)->uint64_t{const auto rc=time_zone_load(ptr<void>(r[0]),str(r[1]));ot2_host_log("TIME_RULE name=%s rc=%u",str(r[1]),rc);return rc;}},
         {"_ZN2nn4time14ToCalendarTimeEPNS0_12CalendarTimeEPNS0_22CalendarAdditionalInfoERKNS0_9PosixTimeERKNS0_12TimeZoneRuleE",calendar_time},
         {"_ZN2nn4time14ToCalendarTimeEPNS0_12CalendarTimeEPNS0_22CalendarAdditionalInfoERKNS0_9PosixTimeE",calendar_time_current},
         {"_ZN2nn4time19ToCalendarTimeInUtcERKNS0_9PosixTimeE",[](Registers r)->uint64_t{CalendarTime c{};time_zone_utc(&c,nullptr,*ptr<int64_t>(r[0]));uint64_t out;memcpy(&out,&c,8);return out;}},
@@ -389,6 +511,53 @@ const std::vector<HostService>& host_services() {
         {"__tm_to_tzname",[](Registers r)->uint64_t{const auto name=ptr<const tm>(r[0])->tm_zone;return reinterpret_cast<uint64_t>(name?name:"");}},
         {"_ZN2nn5swkbd12ShowKeyboardEPNS0_6StringERKNS0_15ShowKeyboardArgE",show_keyboard},
         {"_ZN2nn7account10InitializeEv",ok},
+        {"_ZN2nn4bcat10InitializeEv",[](Registers)->uint64_t{ot2_host_log("BCAT_OFFLINE empty_cache=1");return 0;}},
+        // Horizon's expected balance is a policy between application and
+        // system-library audio. This host owns only the application stream;
+        // its actual sample volume and Android focus handling remain in audio.cpp.
+        {"_ZN2nn2oe24SetExpectedVolumeBalanceEff",ok},
+        {"_ZN2nn4bcat25MountDeliveryCacheStorageEv",[](Registers)->uint64_t{std::lock_guard lock(bcat_mutex);bcat_mounted=true;return 0;}},
+        {"_ZN2nn4bcat27UnmountDeliveryCacheStorageEv",[](Registers)->uint64_t{std::lock_guard lock(bcat_mutex);bcat_mounted=false;return 0;}},
+        {"_ZN2nn4bcat31EnumerateDeliveryCacheDirectoryEPiPNS0_13DirectoryNameEi",bcat_empty_entries},
+        {"_ZN2nn4bcat17DeliveryCacheFileC1Ev",ok},
+        {"_ZN2nn4bcat17DeliveryCacheFileD1Ev",ok},
+        {"_ZN2nn4bcat17DeliveryCacheFile4OpenERKNS0_13DirectoryNameERKNS0_8FileNameE",[](Registers)->uint64_t{std::lock_guard lock(bcat_mutex);return bcat_mounted?BcatNotFound:BcatNotMounted;}},
+        {"_ZN2nn4bcat17DeliveryCacheFile5CloseEv",ok},
+        {"_ZN2nn4bcat17DeliveryCacheFile7GetSizeEv",ok},
+        {"_ZN2nn4bcat17DeliveryCacheFile4ReadEPmlPvm",[](Registers r)->uint64_t{if(r[1])*ptr<uint64_t>(r[1])=0;return BcatNotOpen;}},
+        {"_ZN2nn4bcat22DeliveryCacheDirectoryC1Ev",ok},
+        {"_ZN2nn4bcat22DeliveryCacheDirectoryD1Ev",ok},
+        {"_ZN2nn4bcat22DeliveryCacheDirectory4OpenERKNS0_13DirectoryNameE",[](Registers)->uint64_t{std::lock_guard lock(bcat_mutex);return bcat_mounted?BcatNotFound:BcatNotMounted;}},
+        {"_ZN2nn4bcat22DeliveryCacheDirectory5CloseEv",ok},
+        {"_ZN2nn4bcat22DeliveryCacheDirectory8GetCountEv",ok},
+        {"_ZN2nn4bcat22DeliveryCacheDirectory4ReadEPiPNS0_27DeliveryCacheDirectoryEntryEi",[](Registers r)->uint64_t{if(r[1])*ptr<int32_t>(r[1])=0;return BcatNotOpen;}},
+        {"_ZN2nn4bcat21DeliveryCacheProgressC1Ev",[](Registers r)->uint64_t{std::lock_guard lock(bcat_mutex);bcat_progress[r[0]]={};return 0;}},
+        {"_ZN2nn4bcat21DeliveryCacheProgressD1Ev",[](Registers r)->uint64_t{std::lock_guard lock(bcat_mutex);bcat_progress.erase(r[0]);return 0;}},
+        {"_ZN2nn4bcat21DeliveryCacheProgress6UpdateEv",ok},
+        {"_ZN2nn4bcat24RequestSyncDeliveryCacheEPNS0_21DeliveryCacheProgressE",[](Registers r)->uint64_t{std::lock_guard lock(bcat_mutex);bcat_progress[r[0]]={9,BcatOffline};return BcatOffline;}},
+        {"_ZNK2nn4bcat21DeliveryCacheProgress9GetStatusEv",[](Registers r)->uint64_t{std::lock_guard lock(bcat_mutex);auto i=bcat_progress.find(r[0]);return i==bcat_progress.end()?0:i->second.status;}},
+        {"_ZNK2nn4bcat21DeliveryCacheProgress9GetResultEv",[](Registers r)->uint64_t{std::lock_guard lock(bcat_mutex);auto i=bcat_progress.find(r[0]);return i==bcat_progress.end()?BcatOffline:i->second.result;}},
+        // The SDK implementation dereferences Horizon's account-service
+        // singleton, which is absent because Initialize is hosted here.
+        // Expose the same single local profile used by the other account APIs.
+        {"_ZN2nn7account13PushOpenUsersEv",ok},
+        {"_ZN2nn7account12PopOpenUsersEPiPNS0_10UserHandleEi",[](Registers r)->uint64_t{
+            if(!r[0])return 0x2a2;
+            auto *count=ptr<int32_t>(r[0]);
+            *count=0;
+            if(r[1] && static_cast<int32_t>(r[2])>0){
+                Registers handle{};
+                handle[0]=r[1];
+                open_user(handle);
+                *count=1;
+            }
+            return 0;
+        }},
+        {"_ZN2nn7account19ListPushedOpenUsersEPNS0_3UidEi",[](Registers r)->uint64_t{
+            if(!r[0] || static_cast<int32_t>(r[1]) <= 0)return 0;
+            memcpy(ptr<void>(r[0]),uid.data(),16);
+            return 1;
+        }},
         {"_ZN2nn7account22TryOpenPreselectedUserEPNS0_10UserHandleE",open_user},
         {"_ZN2nn7account8OpenUserEPNS0_10UserHandleERKNS0_3UidE",[](Registers r)->uint64_t{open_user(r);return 0;}},
         {"_ZN2nn7account9GetUserIdEPNS0_3UidERKNS0_10UserHandleE",[](Registers r)->uint64_t{memcpy(ptr<void>(r[0]),uid.data(),16);return 0;}},
@@ -418,17 +587,23 @@ const std::vector<HostService>& host_services() {
         {"_ZN2nn3nsd9ResolveExEPNS0_4FqdnERKS1_",unavailable},
         {"_ZN2nn4pctl25TryBeginFreeCommunicationEb",[](Registers)->uint64_t{return 0;}},
         {"_ZN2nn3err9ShowErrorENS_6ResultE",[](Registers r)->uint64_t{ot2_host_log("SDK_ERROR result=%x module=%u description=%u",unsigned(r[0]),unsigned(r[0])&511,unsigned(r[0])>>9);return 0;}},
-        {"_ZN2nn2oe18GetDesiredLanguageEv",[](Registers)->uint64_t{uint64_t code=0;memcpy(&code,"zh-Hans",7);return code;}},
+        {"_ZN2nn2oe18GetDesiredLanguageEv",desired_language},
+        {"_ZN2nn8settings15GetLanguageCodeEPNS0_12LanguageCodeE",[](Registers r)->uint64_t{if(!r[0])return IoError;*ptr<uint64_t>(r[0])=desired_language(r);return 0;}},
         {"_ZN2nn2oe25GetProgramTotalActiveTimeEv",[](Registers)->uint64_t{return active_time();}},
         {"_ZN2nn2oe16GetOperationModeEv",ok},
         {"_ZN2nn2oe18GetPerformanceModeEv",ok},
         {"_ZN2nn2oe20GetCurrentFocusStateEv",[](Registers)->uint64_t{std::lock_guard lock(activity_mutex);return activity_focus;}},
-        {"_ZN2nn2oe25TryPopNotificationMessageEPj",[](Registers r)->uint64_t{std::lock_guard lock(activity_mutex);if(!focus_notification)return 0;*ptr<uint32_t>(r[0])=15;focus_notification=false;return 1;}},
+        {"_ZN2nn2oe25TryPopNotificationMessageEPj",[](Registers r)->uint64_t{
+            std::lock_guard lock(activity_mutex);if(!r[0])return 0;
+            if(focus_notification){*ptr<uint32_t>(r[0])=15;focus_notification=false;return 1;}
+            if(resume_notification){*ptr<uint32_t>(r[0])=16;resume_notification=false;ot2_host_log("APPLET_RESUME delivered=1");return 1;}
+            return 0;
+        }},
         {"_ZN2nn2oe17FinishStartupLogoEv",ok},
         {"_ZN2nn2oe15SetCpuBoostModeENS0_12CpuBoostModeE",ok},
         {"_ZN2nn2oe27SetPerformanceConfigurationENS0_15PerformanceModeEi",ok},
         {"_ZN2nn2oe20SetFocusHandlingModeENS0_17FocusHandlingModeE",ok},
-        {"_ZN2nn2oe28SetResumeNotificationEnabledEb",ok},
+        {"_ZN2nn2oe28SetResumeNotificationEnabledEb",[](Registers r)->uint64_t{std::lock_guard lock(activity_mutex);resume_notification_enabled=r[0]!=0;if(!resume_notification_enabled)resume_notification=false;ot2_host_log("APPLET_RESUME enabled=%u",resume_notification_enabled);return 0;}},
         {"_ZN2nn2oe42SetOperationModeChangedNotificationEnabledEb",ok},
         {"_ZN2nn2oe44SetPerformanceModeChangedNotificationEnabledEb",ok},
         {"_ZN2nn2oe38SetUserInactivityDetectionTimeExtendedEb",ok},
@@ -498,6 +673,18 @@ const std::vector<HostService>& host_services() {
         {"_ZN2nn2fs17MountAddOnContentEPKciPvm",[](Registers r)->uint64_t{auto it=addon_content.find(int32_t(r[1]));return it==addon_content.end()?0x7d402:mount(str(r[0]),it->second,true);}},
         {"_ZN2nn2fs22QueryMountRomCacheSizeEPm",[](Registers r)->uint64_t{*ptr<uint64_t>(r[0])=4096;return 0;}},
         {"_ZN2nn2fs8MountRomEPKcPvm",[](Registers r)->uint64_t{return mount(str(r[0]),romfs,true);}},
+        {"_ZN2nn2fs29QueryMountSystemDataCacheSizeEPmNS_3ncm12SystemDataIdE",[](Registers r)->uint64_t{
+            if(!r[0])return IoError;
+            if(system_data(r[1]).empty())return PathNotFound;
+            *ptr<uint64_t>(r[0])=0;return 0; // host directory needs no SDK cache
+        }},
+        {"_ZN2nn2fs15MountSystemDataEPKcNS_3ncm12SystemDataIdEPvm",mount_system_data},
+        {"_ZN2nn2fs15MountSystemDataEPKcNS_3ncm12SystemDataIdE",mount_system_data},
+        {"_ZN2nn2fs9IsMountedEPKc",[](Registers r)->uint64_t{
+            std::lock_guard lock(filesystem_mutex);
+            const char* name=str(r[0]);
+            return name && mounts.contains(name) ? 1u : 0u;
+        }},
         {"_ZN2nn2fs13MountSaveDataEPKcRKNS_7account3UidE",[](Registers r)->uint64_t{return mount(str(r[0]),user+"/save",false,true);}},
         {"_ZN2nn2fs21MountTemporaryStorageEPKc",[](Registers r)->uint64_t{return mount(str(r[0]),user+"/temporary",false);}},
         {"_ZN2nn2fs14EnsureSaveDataERKNS_7account3UidE",[](Registers)->uint64_t{std::error_code ec;std::filesystem::create_directories(user+"/save",ec);return ec?IoError:0;}},

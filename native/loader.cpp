@@ -237,6 +237,12 @@ uintptr_t LoadedGame::symbol(const std::string& name) const {
     auto it=impl->exports.find(name);
     return it==impl->exports.end() ? 0 : it->second.module->symbol_address(*it->second.symbol);
 }
+std::vector<std::string> LoadedGame::exported_names(const std::string& prefix) const {
+    std::vector<std::string> names;
+    names.reserve(impl->exports.size());
+    for (const auto& entry:impl->exports) if (entry.first.rfind(prefix,0)==0) names.push_back(entry.first);
+    return names;
+}
 std::vector<ModuleView> LoadedGame::modules() const {
     std::vector<ModuleView> result;
     for (const auto& m:impl->modules) result.push_back({m->name,m->memory,m->allocation,m->text_offset,m->text_size,m->ro_offset,m->data_offset,m->build_id});

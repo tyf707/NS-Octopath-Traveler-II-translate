@@ -11,6 +11,8 @@ void vkhost_configure_package(const char* cache_directory,const char* offline_di
 void vkhost_program(const prog_t* program);
 struct ANativeWindow;
 void vkhost_set_window(struct ANativeWindow* window);
+void vkhost_set_aspect_mode(int mode);
+void vkhost_set_present_interval(int value);
 void* ot2_nvn_lookup(const char* name);
 void vkhost_pool_add(const void* memory,uint64_t size);
 void vkhost_pool_del(const void* memory);

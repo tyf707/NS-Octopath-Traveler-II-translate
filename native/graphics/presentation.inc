@@ -1,3 +1,34 @@
+#ifdef __ANDROID__
+#include <sys/system_properties.h>
+#endif
+#include <atomic>
+#include <cstring>
+// 显示填充模式：fit=保持 16:9（左右黑边，默认改前行为）、crop=填满裁切、stretch=拉伸填满。
+// debug.ot2.aspect=fit|crop|stretch 选择；首次显示时读取一次，改属性后重启生效。
+enum DisplayAspect : int { display_fit = 0, display_crop = 1, display_stretch = 2 };
+static std::atomic<int> display_aspect_override{-1}; // -1=未覆盖；0=fit 1=crop 2=stretch
+extern "C" void vkhost_set_aspect_mode(int mode) {display_aspect_override.store(mode,std::memory_order_relaxed);}
+static int display_aspect_mode() {
+#ifdef __ANDROID__
+    const int overridden = display_aspect_override.load(std::memory_order_relaxed);
+    if (overridden >= 0) return overridden;
+    static std::atomic<int> cached{-1};
+    int value = cached.load(std::memory_order_relaxed);
+    if (value < 0) {
+        char property[PROP_VALUE_MAX]{};
+        value = display_stretch;
+        if (__system_property_get("debug.ot2.aspect", property) > 0) {
+            if (!strcmp(property, "fit")) value = display_fit;
+            else if (!strcmp(property, "stretch")) value = display_stretch;
+            else if (!strcmp(property, "crop")) value = display_crop;
+        }
+        cached.store(value, std::memory_order_relaxed);
+    }
+    return value;
+#else
+    return display_fit;
+#endif
+}
 // Display scan-out consumes encoded bytes, including sRGB guest swapchains.
 // A Vulkan sRGB -> UNORM blit decodes them and darkens the displayed image.
 // Sample a compatible UNORM view instead, as D2R's present_src does. This is
@@ -56,8 +87,17 @@ void encode_present_pixels(VkCommandBuffer cmd,const tex_t& texture,Image& targe
     int sx=0,sy=0,sw=texture.d.width,sh=texture.d.height;
     if(crop&&(crop[2]||crop[3])){sx=crop[0];sy=crop[1];sw=crop[2];sh=crop[3];}
     if(sx<0||sy<0||sw<=0||sh<=0||uint64_t(sx)+sw>texture.d.width||uint64_t(sy)+sh>texture.d.height)ot2_host_die("Invalid display crop");
-    const double scale=std::min(double(extent.width)/sw,double(extent.height)/sh);
-    const int dw=std::max(1,int(sw*scale)),dh=std::max(1,int(sh*scale)),dx=(extent.width-dw)/2,dy=(extent.height-dh)/2;
+    const int aspect=display_aspect_mode();
+    const double scale=aspect==display_crop?std::max(double(extent.width)/sw,double(extent.height)/sh):std::min(double(extent.width)/sw,double(extent.height)/sh);
+    int dw=std::max(1,int(sw*scale)),dh=std::max(1,int(sh*scale)),dx=(extent.width-dw)/2,dy=(extent.height-dh)/2;
+    int rsx=sx,rsy=sy,rsw=sw,rsh=sh;
+    if(aspect==display_stretch){dw=extent.width;dh=extent.height;dx=dy=0;}
+    else if(aspect==display_crop){
+        const double target=double(extent.width)/extent.height,source=double(sw)/sh;
+        if(source>target){const int nw=std::max(1,int(sh*target));rsx=sx+(sw-nw)/2;rsw=nw;}
+        else{const int nh=std::max(1,int(sw/target));rsy=sy+(sh-nh)/2;rsh=nh;}
+        dw=extent.width;dh=extent.height;dx=dy=0;
+    }
     ot2::touch_display_size(sw,sh);
     view_t raw{};raw.set_format=raw.set_levels=raw.set_layers=raw.set_target=raw.set_swizzle=1;raw.format=texture.d.format;raw.nlevels=raw.nlayers=1;raw.target=NVN_TEXTURE_TARGET_2D;raw.swizzle=2|(3<<3)|(4<<6)|(5<<9);
     switch(source.format){case VK_FORMAT_R8G8B8A8_SRGB:raw.format=NVN_FORMAT_RGBA8;break;case VK_FORMAT_B8G8R8A8_SRGB:raw.format=NVN_FORMAT_BGRA8;break;default:break;}
@@ -73,6 +113,6 @@ void encode_present_pixels(VkCommandBuffer cmd,const tex_t& texture,Image& targe
     bind_pipeline(cmd,VK_PIPELINE_BIND_POINT_GRAPHICS,pipeline);bind_descriptors(cmd,VK_PIPELINE_BIND_POINT_GRAPHICS,present_layout,present_set);
     VkViewport viewport{float(dx),float(dy),float(dw),float(dh),0,1};bind_viewport(cmd,viewport);bind_scissor(cmd,{{dx,dy},{uint32_t(dw),uint32_t(dh)}});
     const float w=texture.d.width,h=texture.d.height;
-    const float constants[]{sx/w,sy/h,sw/w,sh/h,(sx+.5f)/w,(sy+.5f)/h,(sx+sw-.5f)/w,(sy+sh-.5f)/h};
+    const float constants[]{rsx/w,rsy/h,rsw/w,rsh/h,(rsx+.5f)/w,(rsy+.5f)/h,(rsx+rsw-.5f)/w,(rsy+rsh-.5f)/h};
     vkCmdPushConstants(cmd,present_layout,VK_SHADER_STAGE_FRAGMENT_BIT,0,sizeof(constants),constants);vkCmdDraw(cmd,3,1,0,0);end_rendering_compatible(cmd);
 }

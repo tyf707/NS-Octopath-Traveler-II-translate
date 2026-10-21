@@ -2,6 +2,7 @@
 #include "host_services.h"
 #include "text_input.h"
 #include "guest.h"
+#include "game_profile.h"
 #include "save_transaction.h"
 #include "thread_services.h"
 #include <jni.h>
@@ -242,9 +243,25 @@ extern "C" JNIEXPORT jlong JNICALL Java_dev_ot2_port_MainActivity_getNativeFrame
 extern "C" JNIEXPORT jdoubleArray JNICALL Java_dev_ot2_port_MainActivity_getNativeFrameStats(JNIEnv* env,jclass){ot2_thread_dump_state();double values[4];vkhost_frame_stats(values);auto result=env->NewDoubleArray(4);if(result)env->SetDoubleArrayRegion(result,0,4,values);return result;}
 extern "C" JNIEXPORT jint JNICALL Java_dev_ot2_port_MainActivity_setNativeTargetFps(JNIEnv*,jclass,jint fps){ot2::set_frame_rate_target(fps);return ot2::frame_rate_applied();}
 
+extern "C" JNIEXPORT void JNICALL Java_dev_ot2_port_MainActivity_setNativePatchList(JNIEnv* env,jclass,jstring list) {
+    if(!list) {ot2::set_patch_list(nullptr);return;}
+    const char* text=env->GetStringUTFChars(list,nullptr);
+    if(!text) return;
+    ot2::set_patch_list(text);
+    ot2_host_log("PATCHES declared=%s",text);
+    env->ReleaseStringUTFChars(list,text);
+}
+extern "C" JNIEXPORT void JNICALL Java_dev_ot2_port_MainActivity_setNativeEngineKind(JNIEnv*,jclass,jint kind) {
+    ot2::set_engine_kind(kind);ot2_host_log("ENGINE adapter=%s",ot2::engine_name());
+}
+extern "C" JNIEXPORT void JNICALL Java_dev_ot2_port_MainActivity_setNativeAspectMode(JNIEnv*,jclass,jint mode) {vkhost_set_aspect_mode(mode);}
+extern "C" JNIEXPORT void JNICALL Java_dev_ot2_port_MainActivity_setNativePresentInterval(JNIEnv*,jclass,jint value) {vkhost_set_present_interval(value);}
 extern "C" JNIEXPORT void JNICALL Java_dev_ot2_port_MainActivity_setNativeFocus(JNIEnv*,jclass,jint state) {
     if(state==3)ot2::freeze_guest_clock(1,true);
-    ot2::set_activity_focus(state);ot2::set_text_input_available(state!=3);vkhost_suspend(state==3);
+    ot2::set_activity_focus(state);ot2::set_text_input_available(state!=3);
+    // 只有 state==1（resumed 且窗口有焦点）才继续出图。
+    // pause（2）时 surface 可能随后被销毁，先暂停呈现，避免宿主线程碰已销毁的 surface。
+    vkhost_suspend(state!=1);
     if(state!=3)ot2::freeze_guest_clock(1,false);
 }
 extern "C" JNIEXPORT jobjectArray JNICALL Java_dev_ot2_port_MainActivity_getNativeTextInput(JNIEnv* env,jclass){

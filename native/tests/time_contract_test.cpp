@@ -18,6 +18,7 @@
 extern "C" void ot2_host_log(const char*,...) {}
 extern "C" [[noreturn]] void ot2_host_die(const char*,...) {throw std::runtime_error("Unexpected host failure");}
 extern "C" uint64_t ot2_call_guest(const char*,const uint64_t*) {throw std::runtime_error("Unexpected guest call");}
+extern "C" uint64_t ot2_call_guest_address(uint64_t,const uint64_t*) {throw std::runtime_error("Unexpected guest address call");}
 extern "C" int ot2_signal_event(uint32_t){return 0;}
 extern "C" void vkhost_init(){}
 extern "C" uint64_t vkhost_frame_count(){return 0;}
@@ -64,6 +65,21 @@ static void parser_contract(){
     std::cout<<"PASS TZif v1/v2, Julian/ordinal/signed/all-year recurrence and "<<checked<<" parser truncation/mutation cases\n";
 }
 static void core(){
+    // Unity's FILETIME clock refuses to initialize unless this SDK context is
+    // available, even when GetCurrentTime itself succeeds.
+    struct Context { int64_t offset,steady_seconds; std::array<uint8_t,16> source; };
+    static_assert(sizeof(Context)==0x20);
+    constexpr const char* context="_ZN2nn4time23StandardUserSystemClock21GetSystemClockContextEPNS0_18SystemClockContextE";
+    Guard<Context> first,second;
+    const auto before=time(nullptr);
+    require(!call(context,{addr(&first.value)})&&first.intact(),"user clock context writes exactly 0x20 bytes");
+    require(!call(context,{addr(&second.value)})&&second.intact(),"repeat clock context succeeds");
+    require(!memcmp(&first.value,&second.value,sizeof(Context)),"unchanged clock returns a stable context");
+    const auto anchor=first.value.offset+first.value.steady_seconds;
+    require(anchor>=before-1&&anchor<=time(nullptr)+1,"clock context anchors real UTC seconds to monotonic time");
+    require(std::any_of(first.value.source.begin(),first.value.source.end(),[](auto b){return b!=0;}),"host clock has a nonzero source identity");
+    require(call(context,{0})==uint64_t(116+(901<<9)),"null clock context is rejected");
+    std::cout<<"PASS real UTC user clock context, stable source/anchor and ABI guards\n";
     auto utc=rule("UTC"),ny=rule("America/New_York"),tokyo=rule("Asia/Tokyo");
     constexpr int64_t jan=1704067200;
     require(at(utc,jan,0).offset==0,"UTC offset");

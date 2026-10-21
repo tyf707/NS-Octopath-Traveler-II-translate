@@ -16,6 +16,23 @@
 #include <string.h>
 #define LOG ot2_host_log
 #define die ot2_host_die
+/* guest.cpp 里的最近宿主服务环形记录（C++ 侧实现，extern "C"）。 */
+extern void ot2_gate_ring_log(void);
+/* 协程 state 探针（guest.cpp 的 island 直接写）。 */
+extern uint32_t ot2_coro_probe_state(void);
+extern uint32_t ot2_coro_probe_calls(void);
+extern uint32_t ot2_exc_probe_calls(void);
+extern uint64_t ot2_coro_ptr(void);
+extern uint32_t ot2_coro_ptr_calls(void);
+extern uint64_t ot2_cb_reg(void);
+extern uint32_t ot2_cb_reg_calls(void);
+extern uint64_t ot2_ex_probe(void);
+extern uint32_t ot2_ex_probe_calls(void);
+extern uint32_t ot2_post_probe_calls(void);
+extern uint32_t ot2_prefs_ex_calls(void);
+extern uint64_t ot2_prefs_ex_ptr(void);
+extern uint64_t ot2_nre_ptr(void);
+extern uint32_t ot2_nre_calls(void);
 static uint64_t now_ns(void) { struct timespec t;clock_gettime(CLOCK_MONOTONIC,&t);return (uint64_t)t.tv_sec*1000000000+t.tv_nsec; }
 static uint64_t guest_ns(void) { return now_ns(); }
 static int dm_detclock_enabled(void) { return 0; }
@@ -43,15 +60,25 @@ typedef struct thr {
     struct thr *next;          // 等待链 | Wait chain
     struct thr *all;           // 全部线程链（现场导出用） | All-threads chain (for the state dump)
     int last_svc; uint64_t last_lr;
+    uint8_t guest_context[0x320];
+    int guest_context_valid, paused;
     volatile uintptr_t sample_pc;   // SIGPROF 采样：被打断时的 PC
+    volatile uintptr_t sample_sp;   // SIGPROF 采样：被打断时的 SP
     int closed;                // 句柄已关：与 exited 同时成立才释放对象（Horizon：线程对象随最后一个引用消失） | Handle closed: the object is freed only when this holds together with exited (Horizon: the thread object goes away with the last reference)
     uint64_t nsvc;             // SVC 次数（现场导出用） | SVC count (for the state dump)
+    /* 最近 SVC 环形记录：看主线程在卡住时到底在循环做什么（id / 返回地址 / 参数）。 */
+    /* Recent-SVC ring: shows what the main thread actually loops on while stalled (id / return address / args). */
+    struct { uint64_t id, lr, sp, x0, x1; } svc_ring[16];
+    unsigned svc_ring_pos;
+    uint64_t wait_count;       // 0x1C 等待次数：一直涨说明在循环等，不是死锁 | 0x1C wait count: growing means it loops, not deadlocks
+    uint64_t wait_x0, wait_x1; // 最近一次 0x1C 的锁地址与条件键 | lock address and condition key of the latest 0x1C
     uint32_t mport;         // 宿主线程端口（取 CPU 时间） | Host thread port (to get CPU time)
     uint32_t qos;
 } thr_t;
 static thr_t *g_all;
 
 static pthread_mutex_t G = PTHREAD_MUTEX_INITIALIZER;
+static pthread_cond_t g_context_ready = PTHREAD_COND_INITIALIZER;
 static uintptr_t g_G_holder;
 #define LOCK_G() do { pthread_mutex_lock(&G); thr_t* _gt=(thr_t*)pthread_getspecific(g_keythr); __atomic_store_n(&g_G_holder,_gt?(uintptr_t)_gt->handle:0,__ATOMIC_RELEASE); } while(0)
 #define UNLOCK_G() do { __atomic_store_n(&g_G_holder,0,__ATOMIC_RELEASE); pthread_mutex_unlock(&G); } while(0)
@@ -83,6 +110,25 @@ static thr_t *cur(void) {
     thr_t *t = pthread_getspecific(g_keythr);
     if (!t) die("非客体线程调用了线程 SVC");
     return t;
+}
+int svc_thread_capture_context(const void* context,uint64_t size) {
+    if (!context || size!=0x320) return 0;
+    LOCK_G();
+    thr_t *t=cur();
+    int installed=!t->guest_context_valid;
+    if(installed) {
+        memcpy(t->guest_context,context,sizeof(t->guest_context)); t->guest_context_valid=1;
+        if(t->paused)pthread_cond_broadcast(&g_context_ready);
+    }
+    UNLOCK_G();
+    return installed;
+}
+void svc_thread_release_context(void) {
+    LOCK_G();
+    thr_t *t=cur();
+    while(t->paused) pthread_cond_wait(&t->cv,&G);
+    t->guest_context_valid=0;
+    UNLOCK_G();
 }
 
 // ---------- 等待原语（持 G 调用）----------
@@ -182,6 +228,7 @@ void svc_thread_exit_on_host(void) {
     // No logging here: the exit happens on the guest thread's own stack (some are only a dozen or so KiB), and a printf with floating point would blow the stack (real-device smoke test: SIGBUS when LibcurlResolver exits, backtrace fprintf → __dtoa). Only the time is recorded, and it is printed later in the state dump
     LOCK_G();
     t->exited = 1;
+    pthread_cond_broadcast(&g_context_ready);
     for (thr_t *w = g_wait; w; ) { thr_t *n = w->next; if (w->wkind == 4) wake(w, -1); w = n; }   // 同步等待者重查 | Synchronization waiters re-check
     pthread_setspecific(g_keythr, NULL);
     if (t->closed) thr_free(t);
@@ -194,25 +241,54 @@ void dm_thread_returned(void) { die("客体线程入口函数返回（Horizon �
 // Register the main thread and return its handle (passed to nnosInitialize as the main thread handle)
 static void* watchdog_main(void* arg) {
     (void)arg;
-    for (int i = 0; i < 12; i++) {
+    for (int i = 0; i < 180; i++) {
         struct timespec ts = {5, 0}; nanosleep(&ts, NULL);
         if (pthread_mutex_trylock(&G) != 0) {
             LOG("=== WATCHDOG %d G_BUSY holder=%#llx ===", i, (unsigned long long)__atomic_load_n(&g_G_holder,__ATOMIC_ACQUIRE));
             continue;
         }
         LOG("=== WATCHDOG %d ===", i);
-        for (thr_t *t = g_all; t; t = t->all)
-            LOG("THR h=%#x id=%llu st=%d ex=%d wk=%d wkey=%#llx waddr=%#llx wtag=%#x svc=%#x lr=%#llx n=%llu",
-                t->handle, (unsigned long long)t->id, t->started, t->exited, t->wkind,
-                (unsigned long long)t->wkey, (unsigned long long)t->waddr, t->wtag,
-                t->last_svc, (unsigned long long)t->last_lr, (unsigned long long)t->nsvc);
         pthread_mutex_unlock(&G);
+        /* 采一次 PC：ot2_thread_dump_state 会广播 SIGPROF 并打印 pc=。 */
+        ot2_thread_dump_state();
+        continue;
     }
     return NULL;
 }
+/* sp 所在可读区间的末端（按 /proc/self/maps）；0 = 不在可读映射里。
+ * 直接按 256 字读可能越过栈映射末端撞上 PROT_NONE 保护页，在 watchdog 里
+ * 触发 SIGSEGV（那不是客体线程，「Signal outside guest thread」会直接杀进程）。
+ * End of the readable mapping containing sp (from /proc/self/maps); 0 = not in
+ * a readable mapping. Reading a fixed 256 words can run past the end of a stack
+ * mapping into a PROT_NONE guard page and SIGSEGV on the watchdog thread, which
+ * kills the process ("Signal outside guest thread"). */
+static uintptr_t readable_end(uintptr_t address) {
+    FILE *f = fopen("/proc/self/maps", "r");
+    if (!f) return 0;
+    char line[512]; uintptr_t end = 0;
+    while (fgets(line, sizeof line, f)) {
+        unsigned long long b = 0, e = 0; char perms[8] = {0};
+        if (sscanf(line, "%llx-%llx %7s", &b, &e, perms) != 3) continue;
+        if (address >= (uintptr_t)b && address < (uintptr_t)e) {
+            if (perms[0] == 'r') end = (uintptr_t)e;
+            break;
+        }
+    }
+    fclose(f);
+    return end;
+}
 void ot2_thread_dump_state(void) {
     static int calls;
-    if (calls++ > 40) return;
+    /* Java 每帧也会调进来（getNativeFrameStats），按次数限流会被它耗尽；
+     * 改为按时间限流：4 秒内只 dump 一次，watchdog 的 5 秒周期仍能轮到。 */
+    /* Java also calls this every frame (getNativeFrameStats), so a count-based
+     * limit gets exhausted by it; throttle by time instead: at most one dump per
+     * 4 seconds, which still lets the 5-second watchdog cycle through. */
+    static uint64_t last_ns;
+    const uint64_t now = now_ns();
+    if (last_ns && now - last_ns < 4000000000ULL) return;
+    last_ns = now;
+    calls++;
     if (pthread_mutex_trylock(&G) != 0) {
         LOG("=== STATE_DUMP %d G_BUSY holder=%#x ===", calls, (unsigned)__atomic_load_n(&g_G_holder,__ATOMIC_ACQUIRE));
         return;
@@ -222,16 +298,85 @@ void ot2_thread_dump_state(void) {
     usleep(8000);
     if (pthread_mutex_trylock(&G) != 0) { LOG("=== STATE_DUMP %d G_BUSY2 ===", calls); return; }
     LOG("=== STATE_DUMP %d ===", calls);
+    /* 等锁线程的 waddr 附近内存：条件变量/互斥量结构里通常有 owner 线程标识。 */
+    for (thr_t *t = g_all; t; t = t->all) if (t->pt && t->waddr && t->wkind) {
+        const uintptr_t base = t->waddr - 0x20;
+        LOG("WAITOBJ h=%#x waddr=%#llx", t->handle, (unsigned long long)t->waddr);
+        const uintptr_t *w = (const uintptr_t *)base;
+        for (unsigned i = 0; i < 8; i++) LOG("   [%+03x] %#llx", (int)(i * 8 - 0x20), (unsigned long long)w[i]);
+    }
     for (thr_t *t = g_all; t; t = t->all)
         LOG("THR h=%#x id=%llu st=%d ex=%d wk=%d wkey=%#llx waddr=%#llx wtag=%#x svc=%#x lr=%#llx pc=%#llx n=%llu",
             t->handle, (unsigned long long)t->id, t->started, t->exited, t->wkind,
             (unsigned long long)t->wkey, (unsigned long long)t->waddr, t->wtag,
             t->last_svc, (unsigned long long)t->last_lr, (unsigned long long)t->sample_pc, (unsigned long long)t->nsvc);
+    for (thr_t *t = g_all; t; t = t->all) if (t->pt && t->sample_sp) {
+        const uintptr_t sp = t->sample_sp;
+        const uintptr_t end = readable_end(sp);
+        unsigned words = end > sp ? (unsigned)((end - sp) / sizeof(uintptr_t)) : 0;
+        if (words > 256) words = 256;
+        LOG("STACK h=%#x sp=%#llx words=%u", t->handle, (unsigned long long)sp, words);
+        const uintptr_t *w = (const uintptr_t *)sp;
+        for (unsigned i = 0; i < words; i++) LOG("   [%02u] %#llx", i, (unsigned long long)w[i]);
+    }
+    LOG("CORO_STATE state=%u calls=%u exc=%u ptr=%#llx ptrcalls=%u cbreg=%#llx cbregcalls=%u exist=%#llx excalls=%u postcalls=%u",
+        ot2_coro_probe_state(), ot2_coro_probe_calls(), ot2_exc_probe_calls(),
+        (unsigned long long)ot2_coro_ptr(), ot2_coro_ptr_calls(),
+        (unsigned long long)ot2_cb_reg(), ot2_cb_reg_calls(),
+        (unsigned long long)ot2_ex_probe(), ot2_ex_probe_calls(), ot2_post_probe_calls());
+    LOG("EXCEPTIONS prefs=%u nre=%u nreptr=%#llx prefsptr=%#llx", ot2_prefs_ex_calls(), ot2_nre_calls(), (unsigned long long)ot2_nre_ptr(), (unsigned long long)ot2_prefs_ex_ptr());
+    /* 主线程最近的 SVC 序列：id 循环 = 每帧固定系统调用；0x1c 计数的增长速度可区分「循环等」与「死等」。 */
+    /* The main thread's latest SVC sequence: a repeating id pattern = fixed per-frame syscalls; the 0x1c count growth distinguishes "looping wait" from "dead wait". */
+    for (thr_t *t = g_all; t; t = t->all) if (t->handle == 0x1001) {
+        LOG("SVCRING h=%#x waits=%llu lastwait-x0=%#llx lastwait-x1=%#llx",
+            t->handle, (unsigned long long)t->wait_count,
+            (unsigned long long)t->wait_x0, (unsigned long long)t->wait_x1);
+        const unsigned n = t->svc_ring_pos < 16 ? t->svc_ring_pos : 16;
+        for (unsigned i = 0; i < n; i++) {
+            const unsigned k = (t->svc_ring_pos - n + i) % 16;
+            LOG("   SVC id=%#llx lr=%#llx sp=%#llx x0=%#llx x1=%#llx",
+                (unsigned long long)t->svc_ring[k].id, (unsigned long long)t->svc_ring[k].lr,
+                (unsigned long long)t->svc_ring[k].sp, (unsigned long long)t->svc_ring[k].x0,
+                (unsigned long long)t->svc_ring[k].x1);
+        }
+    }
+    ot2_gate_ring_log();
     pthread_mutex_unlock(&G);
 }
 void ot2_thread_record_sample(uintptr_t pc) {
+    /* 早期（线程键尚未创建）也可能被调用：先确保键存在，否则
+     * pthread_getspecific 拿到的是未初始化键，会读错槽位。 */
+    /* May be called very early, before the thread key exists: create it first,
+     * otherwise pthread_getspecific reads an uninitialised slot. */
+    pthread_once(&g_key_once,create_thread_key);
     thr_t* t = (thr_t*)pthread_getspecific(g_keythr);
     if (t) t->sample_pc = pc;
+}
+void ot2_thread_record_sample_sp(uintptr_t sp) {
+    /* SVC 0x1C（WaitProcessWideKeyAtomic）在极早期就可能出现，此时 TLS 键还未建立；
+     * 必须先用 pthread_once 建键，否则启动即崩（已实测）。 */
+    /* SVC 0x1C (WaitProcessWideKeyAtomic) can happen very early, before the
+     * TLS key is created; create it with pthread_once first or startup crashes
+     * (measured). */
+    pthread_once(&g_key_once,create_thread_key);
+    thr_t* t = (thr_t*)pthread_getspecific(g_keythr);
+    if (t) t->sample_sp = sp;
+}
+/* 每条 SVC 记一条环形记录（只在宿主 svc() 里调一次，纯内存写）。 */
+/* Record one ring entry per SVC (called once from the host svc(), memory writes only). */
+void ot2_thread_record_svc(uint64_t id, uintptr_t sp, uintptr_t lr, uint64_t x0, uint64_t x1) {
+    pthread_once(&g_key_once,create_thread_key);
+    thr_t* t = (thr_t*)pthread_getspecific(g_keythr);
+    if (!t) return;
+    unsigned i = t->svc_ring_pos++ % 16;
+    t->svc_ring[i].id = id; t->svc_ring[i].sp = sp; t->svc_ring[i].lr = lr;
+    t->svc_ring[i].x0 = x0; t->svc_ring[i].x1 = x1;
+    if (id == 0x1c) { t->wait_count++; t->wait_x0 = x0; t->wait_x1 = x1; }
+}
+uint32_t ot2_thread_handle_current(void) {
+    pthread_once(&g_key_once,create_thread_key);
+    thr_t* t=(thr_t*)pthread_getspecific(g_keythr);
+    return t?t->handle:0;
 }
 uint32_t svc_thread_main_init(void) {
     static int watchdog_started;
@@ -329,6 +474,40 @@ int svc_thread(int num, uint64_t *regs) {
     }
     case 0x10: regs[0] = (uint64_t)(uint32_t)cur()->core; return 1;
     case 0x25: { LOCK_G();thr_t *t = h_get((uint32_t)regs[1], O_THREAD); regs[0] = t ? 0 : R_BAD_HANDLE; regs[1] = t ? t->id : 0; UNLOCK_G();return 1; }
+    case 0x32: {  // SetThreadActivity: wait for a truthful guest boundary snapshot.
+        LOCK_G();
+        const uint32_t handle=(uint32_t)regs[0];
+        thr_t *t=h_get(handle,O_THREAD);
+        uint32_t activity=(uint32_t)regs[1];
+        if(!t) regs[0]=R_BAD_HANDLE;
+        else if(activity>1 || t==cur() || t->exited) regs[0]=R_BAD_STATE;
+        else {
+            const uint64_t identity=t->id;
+            t->paused=activity==1;
+            if(!t->paused){pthread_cond_signal(&t->cv);pthread_cond_broadcast(&g_context_ready);}
+            // The target may be in guest code or a hosted graphics call.
+            // Queue the pause and let its next SVC publish a register image;
+            // never turn this ordinary scheduling race into BadState.
+            while(t && activity==1 && t->paused && !t->guest_context_valid && !t->exited){
+                pthread_cond_wait(&g_context_ready,&G);
+                t=h_peek(handle,O_THREAD);
+                if(t && t->id!=identity)t=NULL;
+            }
+            regs[0]=!t?R_BAD_HANDLE:(t->exited || (activity==1&&!t->paused))?R_BAD_STATE:0;
+        }
+        UNLOCK_G();
+        LOG("SET_THREAD_ACTIVITY handle=%#x activity=%u result=%#llx",handle,activity,regs[0]);
+        return 1;
+    }
+    case 0x33: {  // GetThreadContext3: return only a real, paused guest SVC snapshot.
+        LOCK_G();
+        thr_t *t=h_get((uint32_t)regs[1],O_THREAD);
+        if(!t) regs[0]=R_BAD_HANDLE;
+        else if(!regs[0] || !t->paused || !t->guest_context_valid) regs[0]=R_BAD_STATE;
+        else { memcpy((void*)regs[0],t->guest_context,sizeof(t->guest_context)); regs[0]=0; }
+        UNLOCK_G();
+        return 1;
+    }
 
     case 0x1A: {  // ArbitrateLock(w0 持有者句柄, x1 地址, w2 本线程标签) | ArbitrateLock(w0 owner handle, x1 address, w2 this thread's tag)
         thr_t *t = cur(); uint64_t addr = regs[1];
@@ -483,6 +662,8 @@ int svc_thread(int num, uint64_t *regs) {
             thr_t *t = g_h[i].obj;
             g_h[i].type = O_FREE; g_h[i].obj = NULL;
             t->closed = 1;
+            t->paused = 0;pthread_cond_signal(&t->cv);
+            pthread_cond_broadcast(&g_context_ready);
             if (t->exited) thr_free(t);
         }
         UNLOCK_G();
@@ -496,4 +677,5 @@ int svc_thread(int num, uint64_t *regs) {
 #ifdef OT2_THREAD_TESTING
 size_t ot2_thread_test_objects(void){LOCK_G();size_t n=0;for(thr_t* t=g_all;t;t=t->all)n++;UNLOCK_G();return n;}
 size_t ot2_thread_test_waiters(int kind,uint64_t address){LOCK_G();size_t n=0;for(thr_t* t=g_wait;t;t=t->next)if(t->wkind==kind&&(!address||t->waddr==address))n++;UNLOCK_G();return n;}
+size_t ot2_thread_test_pending_pauses(void){LOCK_G();size_t n=0;for(thr_t* t=g_all;t;t=t->all)if(t->paused&&!t->guest_context_valid)n++;UNLOCK_G();return n;}
 #endif

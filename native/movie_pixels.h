@@ -3,11 +3,36 @@
 #include <cstddef>
 #include <cstdint>
 #include <span>
+#include <cstring>
 
 namespace ot2::movie {
 // ByteBuffer output from MediaCodec: OMX planar (19) or semiplanar (21).
 // Reject opaque/vendor layouts instead of interpreting tiled memory as pixels.
 struct YuvLayout {int width{},height{},stride{},slice{},left{},top{},right{},bottom{},format{},standard{1},range{2};};
+inline bool decoder_output_supported(int type,int output,int mode){
+    if(type>=1&&type<=3)return (mode==2&&output==3)||(mode==1&&(output==2||output==4));
+    return (type==4||type==5)&&mode==1&&output==1;
+}
+// SDK DecoderOutputFormat 4 copies Y followed by interleaved UV (subsdk0
+// DecoderImpl::ConvertDecoderOutputFormat, branch +0x6c). Normalize Android's
+// padded planar/semiplanar buffers to that packed NV12 layout, without RGB loss.
+inline bool nv12(std::span<const uint8_t> source,const YuvLayout& p,std::span<uint8_t> out){
+    if(p.width<=0||p.height<=0||p.stride<p.width||p.slice<p.height||p.stride>16384||p.slice>16384||
+       p.left<0||p.top<0||p.right<p.left||p.bottom<p.top||p.right>=p.width||p.bottom>=p.height||
+       (p.format!=19&&p.format!=21)||(p.format==21&&p.stride<2*((p.width+1)/2)))return false;
+    const size_t w=p.right-p.left+1,h=p.bottom-p.top+1;
+    if((w|h|size_t(p.left)|size_t(p.top))&1)return false; // No implicit chroma-phase resampling.
+    const size_t ys=size_t(p.stride)*p.slice,cs=size_t((p.stride+1)/2)*((p.slice+1)/2);
+    const size_t needed=p.format==19?ys+2*cs:ys+size_t(p.stride)*((p.slice+1)/2);
+    if(source.size()<needed||out.size()<w*h+w*(h/2))return false;
+    for(size_t y=0;y<h;++y)memcpy(out.data()+y*w,source.data()+(y+p.top)*p.stride+p.left,w);
+    for(size_t y=0;y<h/2;++y)for(size_t x=0;x<w/2;++x){
+        const size_t cx=x+p.left/2,cy=y+p.top/2,d=w*h+y*w+2*x;
+        if(p.format==19){const auto s=cy*((p.stride+1)/2)+cx;out[d]=source[ys+s];out[d+1]=source[ys+cs+s];}
+        else{const auto s=ys+cy*p.stride+2*cx;out[d]=source[s];out[d+1]=source[s+1];}
+    }
+    return true;
+}
 inline bool rgba(std::span<const uint8_t> source,const YuvLayout& p,std::span<uint8_t> out,bool bgra=false){
     if(p.width<=0||p.height<=0||p.stride<p.width||p.slice<p.height||p.stride>16384||p.slice>16384||
        p.left<0||p.top<0||p.right<p.left||p.bottom<p.top||p.right>=p.width||p.bottom>=p.height||

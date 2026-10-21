@@ -181,7 +181,8 @@ std::map<std::string,Shader> shaders;
 Shader* bound_shaders[6]{};
 Shader& shader_for(const NVNshaderData& sd,const std::string& key) {
     if(auto it=shaders.find(key);it!=shaders.end())return it->second;
-    auto base=shader_binary_directory+"/"+key;
+    const auto cache_key=shader_cache_key(sd,key);
+    auto base=shader_binary_directory+"/"+cache_key;
     if(!std::filesystem::exists(base+".spv") || !std::filesystem::exists(base+".res.json")){
         if(complete_shader_cache)ot2_host_die("Offline shader cache does not contain %s",key.c_str());
         ot2_host_log("WAIT_SHADER key=%s",key.c_str());
@@ -191,7 +192,7 @@ Shader& shader_for(const NVNshaderData& sd,const std::string& key) {
     if(!binary)ot2_host_die("Translated shader missing: %s",key.c_str());size_t size=binary.tellg();
     if(size<20 || size%4)ot2_host_die("Invalid shader size: %s",key.c_str());std::vector<uint32_t> words(size/4);binary.seekg(0);binary.read(reinterpret_cast<char*>(words.data()),size);
     if(words[0]!=0x07230203)ot2_host_die("Invalid shader header: %s",key.c_str());
-    Shader s;std::ifstream meta(base+".res.json");if(!meta)ot2_host_die("Shader metadata missing: %s",key.c_str());meta>>s.reflection;s.resources=std::make_unique<ShaderReflection>(s.reflection);if(s.resources->key!=key)ot2_host_die("Shader reflection key mismatch");
+    Shader s;std::ifstream meta(base+".res.json");if(!meta)ot2_host_die("Shader metadata missing: %s",key.c_str());meta>>s.reflection;s.resources=std::make_unique<ShaderReflection>(s.reflection);if(s.resources->key!=cache_key)ot2_host_die("Shader reflection key mismatch");
     std::set<uint32_t> input_ids;std::map<uint32_t,uint32_t> locations;
     for(size_t at=5;at<words.size();) {auto count=words[at]>>16,op=words[at]&65535;if(!count || at+count>words.size())ot2_host_die("Corrupt SPIR-V instruction");
         if(op==59 && count>=4 && words[at+3]==1)input_ids.insert(words[at+2]);
@@ -1035,6 +1036,8 @@ void execute_draw(uint32_t operation,const uint8_t* parameters) {
     else {
         if(!vertex)ot2_host_die("Vertex program is missing");bool indexed=operation==OP_DRAW_IDX;auto* draw=reinterpret_cast<const p_draw*>(parameters);auto* indices=reinterpret_cast<const p_draw_idx*>(parameters);
         int primitive=indexed?indices->prim:draw->prim;
+        const bool quads=primitive==NVN_DRAW_PRIMITIVE_QUADS;
+        if(quads)primitive=NVN_DRAW_PRIMITIVE_TRIANGLES;
         // NVN often binds the unused tail of an entire streaming allocation.
         // Preserve vertex/instance IDs, but upload only the prefix that this
         // draw can fetch (including attribute offsets and one conservative slot).
@@ -1102,7 +1105,13 @@ void execute_draw(uint32_t operation,const uint8_t* parameters) {
         }
         resources.pipeline=prepared.pipeline;const auto& ds=prepared.depth;const auto& blend=prepared.blend;
         VkBuffer ib{};VkDeviceSize ib_offset=0;VkIndexType it=VK_INDEX_TYPE_UINT16;
-        if(indexed){if(indices->itype==0){std::vector<uint16_t> converted(indices->count);auto* src=reinterpret_cast<const uint8_t*>(indices->ibuf);for(int i=0;i<indices->count;i++)converted[i]=src[i];auto b=make_buffer(converted.data(),converted.size()*2,VK_BUFFER_USAGE_INDEX_BUFFER_BIT);ib=b.buffer;ib_offset=b.offset;resources.buffers.push_back(b);}else{it=indices->itype==1?VK_INDEX_TYPE_UINT16:VK_INDEX_TYPE_UINT32;auto b=readonly_buffer(reinterpret_cast<const void*>(indices->ibuf),size_t(indices->count)*(indices->itype==1?2:4),VK_BUFFER_USAGE_INDEX_BUFFER_BIT);ib=b.buffer;ib_offset=b.offset;resources.buffers.push_back(b);}}
+        uint32_t quad_index_count=0;
+        if(quads){
+            if(!indexed && (draw->first<0 || draw->count<0))ot2_host_die("Invalid quad vertex range");
+            auto converted=quad_indices(indexed?reinterpret_cast<const void*>(indices->ibuf):nullptr,indexed?indices->count:draw->count,indexed?indices->itype:2,indexed?0:draw->first);
+            quad_index_count=uint32_t(converted.size());it=VK_INDEX_TYPE_UINT32;
+            if(quad_index_count){auto b=make_buffer(converted.data(),converted.size()*4,VK_BUFFER_USAGE_INDEX_BUFFER_BIT);ib=b.buffer;ib_offset=b.offset;resources.buffers.push_back(b);}
+        }else if(indexed){if(indices->itype==0){std::vector<uint16_t> converted(indices->count);auto* src=reinterpret_cast<const uint8_t*>(indices->ibuf);for(int i=0;i<indices->count;i++)converted[i]=src[i];auto b=make_buffer(converted.data(),converted.size()*2,VK_BUFFER_USAGE_INDEX_BUFFER_BIT);ib=b.buffer;ib_offset=b.offset;resources.buffers.push_back(b);}else{it=indices->itype==1?VK_INDEX_TYPE_UINT16:VK_INDEX_TYPE_UINT32;auto b=readonly_buffer(reinterpret_cast<const void*>(indices->ibuf),size_t(indices->count)*(indices->itype==1?2:4),VK_BUFFER_USAGE_INDEX_BUFFER_BIT);ib=b.buffer;ib_offset=b.offset;resources.buffers.push_back(b);}}
         // STORE_OP_NONE preserves prior memory only when the entire rendering
         // instance has no writes to that aspect. DONT_CARE does not provide
         // that guarantee. Unlike Metal, Vulkan fixes store operations at begin:
@@ -1178,7 +1187,8 @@ void execute_draw(uint32_t operation,const uint8_t* parameters) {
         // new recording. Never reuse the bounds stored in PreparedGraphicsPipeline.
         if(dynamic_depth_bounds&&depth_bounds_supported){const auto& bounds=render_state.depth_bounds;vkCmdSetDepthBounds(cmd,bounds.enable?bounds.minimum:0.f,bounds.enable?bounds.maximum:1.f);}
         for(auto& [binding,index]:std::span(vertex_buffers.data(),vertex_buffer_count)){VkDeviceSize offset=resources.buffers[index].offset;bind_vertex(cmd,binding,resources.buffers[index].buffer,offset);}
-        if(indexed){bind_index(cmd,ib,ib_offset,it);vkCmdDrawIndexed(cmd,indices->count,indices->instances,0,indices->base_vertex,indices->base_instance);}else vkCmdDraw(cmd,draw->count,draw->instances,draw->first,draw->base_instance);
+        if(quads){if(quad_index_count){bind_index(cmd,ib,ib_offset,it);vkCmdDrawIndexed(cmd,quad_index_count,indexed?indices->instances:draw->instances,0,indexed?indices->base_vertex:0,indexed?indices->base_instance:draw->base_instance);}}
+        else if(indexed){bind_index(cmd,ib,ib_offset,it);vkCmdDrawIndexed(cmd,indices->count,indices->instances,0,indices->base_vertex,indices->base_instance);}else vkCmdDraw(cmd,draw->count,draw->instances,draw->first,draw->base_instance);
         if(samples_active&&!emulate_samples)vkCmdEndQuery(cmd,occlusion_query,query_slot);
         if(!batching || side_effects)finish_commands(cmd);else ++batch_operations;
         if(samples_active&&!batching){drain_gpu_locked();uint64_t value=0;if(emulate_samples)memcpy(&value,sample_buffer.mapped,8);else check(vkGetQueryPoolResults(device,occlusion_query,query_slot,1,8,&value,8,VK_QUERY_RESULT_64_BIT),"occlusion results");counter_epoch->samples+=value;pending_queries=0;}
